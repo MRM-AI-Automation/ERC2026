@@ -1,0 +1,8 @@
+scan_filter_chain:
+  ros__parameters:
+    filter1:
+      name: rear_mask
+      type: laser_filters/LaserScanAngularBoundsFilter
+      params:
+        lower_angle: 2.96705972839   # 170 deg
+        upper_angle: 3.31612557879   # 190 deg

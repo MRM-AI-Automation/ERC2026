@@ -1,587 +1,1420 @@
+#include <rclcpp/rclcpp.hpp>
+
+#include <cmath>
+#include <cstring>
 #include <iostream>
 #include <string>
-#include <thread>
-#include <atomic>
-#include <chrono>
-#include <mutex>
-#include <cstring>
-#include <cmath>
-#include <cerrno>
+#include <sstream>
 #include <algorithm>
+#include <chrono>
+#include <cerrno>
 
-#include <arpa/inet.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 
-#include "rclcpp/rclcpp.hpp"
-#include "geometry_msgs/msg/twist.hpp"
-#include "std_msgs/msg/bool.hpp"
-#include "std_srvs/srv/trigger.hpp"
-#include "aruco_msgs/msg/arm_pwm.hpp"
+#include <geometry_msgs/msg/twist.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/bool.hpp>
 
-using namespace std::chrono_literals;
+#include <aruco_msgs/msg/arm_pwm.hpp>
 
-static constexpr float track_width = 1.005f;
-static constexpr float wheel_diameter = 0.30f;
-static constexpr float max_wheel_RPM = 100.0f;
 
-static constexpr const char* ESP_IP = "10.0.0.7";
-static constexpr int ESP_PORT = 5005;
-static constexpr int LISTEN_PORT = 5010;
 
-class RelayNode : public rclcpp::Node
+
+
+
+constexpr double TRACK_WIDTH = 1.005;
+constexpr double WHEEL_DIAMETER = 0.30;
+constexpr double MAX_WHEEL_RPM = 100.0;
+
+
+
+
+
+
+class ArmStateSubscriber : public rclcpp::Node
 {
 public:
-    RelayNode()
-        : Node("relay_node_udp_bridge")
+
+    ArmStateSubscriber()
+        : Node("arm_state_subscriber")
     {
-        cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
-            "/cmd_vel",
-            10,
-            std::bind(
-                &RelayNode::cmdVelCallback,
-                this,
-                std::placeholders::_1));
 
-        arm_sub_ = this->create_subscription<aruco_msgs::msg::ArmPwm>(
-            "/arm_pwm",
-            10,
-            std::bind(
-                &RelayNode::armCallback,
-                this,
-                std::placeholders::_1));
 
-        mode_cmd_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-            "/autonomous_mode_cmd",
-            10,
-            std::bind(
-                &RelayNode::modeCmdCallback,
-                this,
-                std::placeholders::_1));
+
+
+        udp_ip_tx_ = "10.0.0.68";
+        udp_port_tx_ = 5005;
+
+
+
+
+
+        sock_tx_ = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if (sock_tx_ < 0)
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Failed to create TX socket: %s",
+                std::strerror(errno)
+            );
+        }
+
+
+
+
+
+        rx_sock_ = socket(AF_INET, SOCK_DGRAM, 0);
+
+        if (rx_sock_ < 0)
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Failed to create RX socket: %s",
+                std::strerror(errno)
+            );
+        }
+
+
+
+
+
+        int opt = 1;
+
+        setsockopt(
+            rx_sock_,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &opt,
+            sizeof(opt)
+        );
+
+
+
+
+
+        sockaddr_in rx_addr{};
+
+        rx_addr.sin_family = AF_INET;
+        rx_addr.sin_addr.s_addr = INADDR_ANY;
+        rx_addr.sin_port = htons(5005);
+
+        if (
+            bind(
+                rx_sock_,
+                reinterpret_cast<sockaddr*>(&rx_addr),
+                sizeof(rx_addr)
+            ) < 0
+        )
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Failed to bind RX socket: %s",
+                std::strerror(errno)
+            );
+        }
+
+
+
+
+
+        int flags = fcntl(
+            rx_sock_,
+            F_GETFL,
+            0
+        );
+
+        if (flags >= 0)
+        {
+            fcntl(
+                rx_sock_,
+                F_SETFL,
+                flags | O_NONBLOCK
+            );
+        }
+
+
+
+
+
+        tx_addr_.sin_family = AF_INET;
+        tx_addr_.sin_port = htons(udp_port_tx_);
+
+        if (
+            inet_pton(
+                AF_INET,
+                udp_ip_tx_.c_str(),
+                &tx_addr_.sin_addr
+            ) <= 0
+        )
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Invalid TX IP address: %s",
+                udp_ip_tx_.c_str()
+            );
+        }
+
+
+
+
+
+        ref_string_ = "M0L0R0T0U0S0G0Z0E";
+        send_string_ = ref_string_;
+
+
+
+
+
+        automate_ = false;
+
+
+
+
 
         mode_state_pub_ =
             this->create_publisher<std_msgs::msg::Bool>(
                 "/autonomous_mode_state",
-                10);
+                10
+            );
 
-        mode_timer_ = this->create_wall_timer(
-            200ms,
-            std::bind(
-                &RelayNode::publishModeState,
-                this));
 
-        toggle_srv_ =
+
+
+
+        automation_service_ =
             this->create_service<std_srvs::srv::Trigger>(
                 "/toggle_autonomous",
                 std::bind(
-                    &RelayNode::toggleAutonomousService,
+                    &ArmStateSubscriber::toggle_autonomous_callback,
                     this,
                     std::placeholders::_1,
-                    std::placeholders::_2));
+                    std::placeholders::_2
+                )
+            );
 
-        listener_thread_ =
-            std::thread(
-                &RelayNode::udpListenerThread,
-                this);
 
-        sender_thread_ =
-            std::thread(
-                &RelayNode::udpSenderThread,
-                this);
+
+
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Relay node started");
+            "[MANUAL] Initial mode"
+        );
+
+        publish_mode_state();
+
+
+
+
+
+        looptime_ = 0.0025;
+
+        timer_ = this->create_wall_timer(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::duration<double>(looptime_)
+            ),
+            std::bind(
+                &ArmStateSubscriber::send_pwm,
+                this
+            )
+        );
+
+
+
+
+
+        cmd_vel_sub_ =
+            this->create_subscription<geometry_msgs::msg::Twist>(
+                "/cmd_vel",
+                10,
+                std::bind(
+                    &ArmStateSubscriber::cmd_vel_callback,
+                    this,
+                    std::placeholders::_1
+                )
+            );
+
+
+
+
+
+        virtualarm_ =
+            this->create_subscription<aruco_msgs::msg::ArmPwm>(
+                "/joint_states",
+                10,
+                std::bind(
+                    &ArmStateSubscriber::joint_callback,
+                    this,
+                    std::placeholders::_1
+                )
+            );
+
+        realArm_ =
+            this->create_subscription<aruco_msgs::msg::ArmPwm>(
+                "/joint_angles",
+                10,
+                std::bind(
+                    &ArmStateSubscriber::arm_callback,
+                    this,
+                    std::placeholders::_1
+                )
+            );
+
+
+
+
+
+        real_l1_ = 0.0;
+        real_l2_ = 0.0;
+        real_swivel_ = 0.0;
+
+        sim_l1_ = 0.0;
+        sim_l2_ = 0.0;
+        sim_swivel_ = 0.0;
+
+        sim_gripper_ = 0;
+
+        gripperEngage_ = false;
+
+
+
+
+
+        link1_error_prev_ = 0.0;
+        link1_error_int_ = 0.0;
+
+        pid_const_link1_p_ = 25.0;
+        pid_const_link1_i_ = 0.1;
+        pid_const_link1_d_ = 40.0;
+
+        link2_error_prev_ = 0.0;
+        link2_error_int_ = 0.0;
+
+        pid_const_link2_p_ = 25.0;
+        pid_const_link2_i_ = 1.0;
+        pid_const_link2_d_ = 40.0;
+
+        swivel_error_prev_ = 0.0;
+        swivel_error_int_ = 0.0;
+
+        pid_const_swivel_p_ = 100.0;
+        pid_const_swivel_i_ = 0.08;
+        pid_const_swivel_d_ = 10.0;
+
+        pwm_l1_ = 0;
+        pwm_l2_ = 0;
+        pwm_swivel_ = 0;
+
+
+
+
+
+        linear_ = 0.0;
+        angular_ = 0.0;
+
+        left_ = 0.0;
+        right_ = 0.0;
+
+        left_rpm_ = 0.0;
+        right_rpm_ = 0.0;
+
+        left_pwm_ = 0.0;
+        right_pwm_ = 0.0;
+
+        pwm_enabled_ = false;
+
+
+
+
+
+        max_linear_velocity_ =
+            (
+                M_PI *
+                WHEEL_DIAMETER *
+                MAX_WHEEL_RPM
+            ) / 60.0;
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Combined Arm + Rover Controller started"
+        );
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Max rover velocity: %.3f m/s",
+            max_linear_velocity_
+        );
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Service: /toggle_autonomous [std_srvs/srv/Trigger]"
+        );
     }
 
-    ~RelayNode()
-    {
-        running_.store(false);
 
-        if (listener_socket_ >= 0)
-        {
-            shutdown(listener_socket_, SHUT_RDWR);
-            close(listener_socket_);
-            listener_socket_ = -1;
-        }
 
-        if (sender_socket_ >= 0)
-        {
-            shutdown(sender_socket_, SHUT_RDWR);
-            close(sender_socket_);
-            sender_socket_ = -1;
-        }
 
-        if (listener_thread_.joinable())
-            listener_thread_.join();
 
-        if (sender_thread_.joinable())
-            sender_thread_.join();
-    }
 
-private:
-
-    void toggleAutonomousService(
-        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-    {
-        bool new_mode = !autonomous_mode_.load();
-
-        autonomous_mode_.store(new_mode);
-
-        if (!new_mode)
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-
-            last_motor_packet_ = "L0R0";
-            last_arm_packet_.clear();
-        }
-
-        response->success = true;
-        response->message =
-            new_mode ? "Autonomous ON" : "Autonomous OFF";
-    }
-
-    void cmdVelCallback(
-        const geometry_msgs::msg::Twist::SharedPtr msg)
-    {
-        if (!autonomous_mode_.load())
-            return;
-
-        float linear_vel =
-            static_cast<float>(msg->linear.x) * 1.2f;
-
-        float angular_vel =
-            -static_cast<float>(msg->angular.z) * 1.2f;
-
-        const float max_linear_velocity =
-            static_cast<float>(M_PI) *
-            wheel_diameter *
-            max_wheel_RPM /
-            60.0f;
-
-        linear_vel = std::clamp(
-            linear_vel,
-            -max_linear_velocity,
-            max_linear_velocity);
-
-        float max_angular_velocity =
-            (max_linear_velocity -
-             std::fabs(linear_vel)) *
-            2.0f /
-            track_width;
-
-        max_angular_velocity =
-            std::max(0.0f, max_angular_velocity);
-
-        angular_vel = std::clamp(
-            angular_vel,
-            -max_angular_velocity,
-            max_angular_velocity);
-
-        float right_vel =
-            linear_vel +
-            angular_vel * track_width / 2.0f;
-
-        float left_vel =
-            linear_vel -
-            angular_vel * track_width / 2.0f;
-
-        float right_rpm =
-            right_vel *
-            60.0f /
-            (wheel_diameter *
-             static_cast<float>(M_PI));
-
-        float left_rpm =
-            left_vel *
-            60.0f /
-            (wheel_diameter *
-             static_cast<float>(M_PI));
-
-        right_rpm = std::clamp(
-            right_rpm,
-            -max_wheel_RPM,
-            max_wheel_RPM);
-
-        left_rpm = std::clamp(
-            left_rpm,
-            -max_wheel_RPM,
-            max_wheel_RPM);
-
-        int right_pct = static_cast<int>(
-            std::round(
-                std::fabs(right_rpm) /
-                max_wheel_RPM *
-                100.0f));
-
-        int left_pct = static_cast<int>(
-            std::round(
-                std::fabs(left_rpm) /
-                max_wheel_RPM *
-                100.0f));
-
-        right_pct = std::clamp(right_pct, 0, 99);
-        left_pct = std::clamp(left_pct, 0, 99);
-
-        std::string packet;
-
-        if (left_rpm >= 0.0f && right_rpm >= 0.0f)
-        {
-            packet =
-                "L" +
-                std::to_string(left_pct) +
-                "R" +
-                std::to_string(right_pct);
-        }
-        else if (left_rpm < 0.0f && right_rpm < 0.0f)
-        {
-            packet =
-                "L-" +
-                std::to_string(left_pct) +
-                "R-" +
-                std::to_string(right_pct);
-        }
-        else if (left_rpm < 0.0f && right_rpm >= 0.0f)
-        {
-            packet =
-                "L-" +
-                std::to_string(left_pct) +
-                "R" +
-                std::to_string(right_pct);
-        }
-        else
-        {
-            packet =
-                "L" +
-                std::to_string(left_pct) +
-                "R-" +
-                std::to_string(right_pct);
-        }
-
-        std::lock_guard<std::mutex> lock(mtx_);
-
-        last_motor_packet_ = packet;
-    }
-
-    void armCallback(
-        const aruco_msgs::msg::ArmPwm::SharedPtr msg)
-    {
-        if (!autonomous_mode_.load())
-            return;
-
-        std::lock_guard<std::mutex> lock(mtx_);
-
-        last_arm_data[0] = msg->link1;
-        last_arm_data[1] = msg->link2;
-        last_arm_data[2] = msg->gripper;
-
-        last_arm_packet_ =
-            "T" +
-            std::to_string(
-                static_cast<int>(msg->link1)) +
-            "U" +
-            std::to_string(
-                static_cast<int>(msg->link2)) +
-            "G" +
-            std::to_string(
-                static_cast<int>(msg->gripper));
-    }
-
-    void modeCmdCallback(
-        const std_msgs::msg::Bool::SharedPtr msg)
-    {
-        bool old_mode = autonomous_mode_.load();
-        bool new_mode = msg->data;
-
-        autonomous_mode_.store(new_mode);
-
-        if (old_mode && !new_mode)
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-
-            last_motor_packet_ = "L0R0";
-            last_arm_packet_.clear();
-        }
-    }
-
-    void publishModeState()
+    void publish_mode_state()
     {
         std_msgs::msg::Bool msg;
 
-        msg.data = autonomous_mode_.load();
+        msg.data = automate_;
 
         mode_state_pub_->publish(msg);
     }
 
-    void udpListenerThread()
+
+
+
+
+
+    void toggle_autonomous_callback(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
     {
-        listener_socket_ =
-            socket(AF_INET, SOCK_DGRAM, 0);
+        (void)request;
 
-        if (listener_socket_ < 0)
+
+        automate_ = !automate_;
+
+
+
+
+
+        if (automate_)
         {
-            RCLCPP_ERROR(
+            RCLCPP_INFO(
                 this->get_logger(),
-                "Failed to create UDP listener socket");
+                "[AUTONOMOUS] MODE ENABLED"
+            );
+
+            response->success = true;
+            response->message =
+                "Autonomous mode enabled";
+        }
+
+
+
+
+
+        else
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "[MANUAL] MODE ENABLED"
+            );
+
+
+
+            pwm_enabled_ = false;
+
+            linear_ = 0.0;
+            angular_ = 0.0;
+
+            left_ = 0.0;
+            right_ = 0.0;
+
+            left_pwm_ = 0.0;
+            right_pwm_ = 0.0;
+
+            response->success = true;
+            response->message =
+                "Manual mode enabled";
+        }
+
+        publish_mode_state();
+    }
+
+
+
+
+
+
+    void cmd_vel_callback(
+        const geometry_msgs::msg::Twist::SharedPtr msg)
+    {
+
+
+        if (!automate_)
+        {
+            return;
+        }
+
+
+
+
+
+        linear_ =
+            msg->linear.x * 1.2;
+
+        angular_ =
+            -msg->angular.z * 1.2;
+
+
+
+
+
+        if (
+            linear_ == 0.0 &&
+            angular_ == 0.0
+        )
+        {
+            pwm_enabled_ = false;
+
+            left_ = 0.0;
+            right_ = 0.0;
+
+            left_pwm_ = 0.0;
+            right_pwm_ = 0.0;
 
             return;
         }
 
-        int reuse = 1;
+        pwm_enabled_ = true;
 
-        setsockopt(
-            listener_socket_,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            &reuse,
-            sizeof(reuse));
 
-        sockaddr_in serv{};
-        sockaddr_in cli{};
 
-        serv.sin_family = AF_INET;
-        serv.sin_addr.s_addr = INADDR_ANY;
-        serv.sin_port = htons(LISTEN_PORT);
 
-        if (bind(
-                listener_socket_,
-                reinterpret_cast<sockaddr*>(&serv),
-                sizeof(serv)) < 0)
+
+        if (
+            linear_ >
+            max_linear_velocity_
+        )
         {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to bind UDP port %d: %s",
-                LISTEN_PORT,
-                std::strerror(errno));
-
-            close(listener_socket_);
-            listener_socket_ = -1;
-
-            return;
+            linear_ =
+                max_linear_velocity_;
         }
 
-        timeval timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 200000;
-
-        setsockopt(
-            listener_socket_,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            &timeout,
-            sizeof(timeout));
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "UDP listener running on port %d",
-            LISTEN_PORT);
-
-        char buf[1500];
-
-        while (rclcpp::ok() && running_.load())
+        if (
+            linear_ <
+            -max_linear_velocity_
+        )
         {
-            socklen_t len = sizeof(cli);
-
-            ssize_t n =
-                recvfrom(
-                    listener_socket_,
-                    buf,
-                    sizeof(buf),
-                    0,
-                    reinterpret_cast<sockaddr*>(&cli),
-                    &len);
-
-            if (n <= 0)
-                continue;
-
-            if (!autonomous_mode_.load())
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
-
-                last_manual_packet_ =
-                    std::string(buf, n);
-            }
+            linear_ =
+                -max_linear_velocity_;
         }
 
-        if (listener_socket_ >= 0)
+
+
+
+
+        left_ =
+            linear_ +
+            angular_ *
+            TRACK_WIDTH /
+            2.0;
+
+        right_ =
+            linear_ -
+            angular_ *
+            TRACK_WIDTH /
+            2.0;
+
+
+
+
+
+        left_rpm_ =
+            std::abs(
+                left_ *
+                60.0 /
+                (M_PI * WHEEL_DIAMETER)
+            );
+
+        right_rpm_ =
+            std::abs(
+                right_ *
+                60.0 /
+                (M_PI * WHEEL_DIAMETER)
+            );
+
+
+
+
+
+        left_pwm_ =
+            std::min(
+                left_rpm_ /
+                MAX_WHEEL_RPM *
+                100.0,
+                99.0
+            );
+
+        right_pwm_ =
+            std::min(
+                right_rpm_ /
+                MAX_WHEEL_RPM *
+                100.0,
+                99.0
+            );
+    }
+
+
+
+
+
+
+    std::string format_motor_packet()
+    {
+        int left_pwm =
+            static_cast<int>(left_pwm_);
+
+        int right_pwm =
+            static_cast<int>(right_pwm_);
+
+
+
+
+
+        if (
+            left_ >= 0.0 &&
+            right_ >= 0.0
+        )
         {
-            close(listener_socket_);
-            listener_socket_ = -1;
+            return
+                "L" +
+                std::to_string(right_pwm) +
+                "R" +
+                std::to_string(left_pwm);
+        }
+
+
+
+
+
+        else if (
+            left_ < 0.0 &&
+            right_ < 0.0
+        )
+        {
+            return
+                "L-" +
+                std::to_string(left_pwm) +
+                "R-" +
+                std::to_string(right_pwm);
+        }
+
+
+
+
+
+        else if (
+            left_ < 0.0 &&
+            right_ > 0.0
+        )
+        {
+            return
+                "L-" +
+                std::to_string(left_pwm) +
+                "R" +
+                std::to_string(right_pwm);
+        }
+
+
+
+
+
+        else
+        {
+            return
+                "L" +
+                std::to_string(left_pwm) +
+                "R-" +
+                std::to_string(right_pwm);
         }
     }
 
-    void udpSenderThread()
+
+
+
+
+
+    void joint_callback(
+        const aruco_msgs::msg::ArmPwm::SharedPtr msg)
     {
-        sender_socket_ =
-            socket(AF_INET, SOCK_DGRAM, 0);
+        sim_swivel_ =
+            static_cast<double>(msg->swivel);
 
-        if (sender_socket_ < 0)
+        sim_l1_ =
+            static_cast<double>(msg->link1);
+
+        sim_l2_ =
+            static_cast<double>(msg->link2);
+
+        sim_gripper_ =
+            msg->gripper;
+    }
+
+
+
+
+
+
+    void arm_callback(
+        const aruco_msgs::msg::ArmPwm::SharedPtr msg)
+    {
+        real_l1_ =
+            static_cast<double>(msg->link1);
+
+        real_l2_ =
+            static_cast<double>(msg->link2);
+
+        real_swivel_ =
+            static_cast<double>(msg->swivel);
+
+        real_swivel_ =
+            std::fmod(
+                real_swivel_,
+                360.0
+            );
+
+        if (real_swivel_ < 0.0)
         {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to create UDP sender socket");
+            real_swivel_ += 360.0;
+        }
+    }
 
-            return;
+
+
+
+
+
+    double angle_error(
+        double target,
+        double current)
+    {
+        double error =
+            std::fmod(
+                target -
+                current +
+                180.0,
+                360.0
+            );
+
+        if (error < 0.0)
+        {
+            error += 360.0;
         }
 
-        sockaddr_in esp{};
+        return error - 180.0;
+    }
 
-        esp.sin_family = AF_INET;
-        esp.sin_port = htons(ESP_PORT);
 
-        if (inet_pton(
-                AF_INET,
-                ESP_IP,
-                &esp.sin_addr) != 1)
+
+
+
+
+    void update_arm_pid()
+    {
+        pwm_l1_ = 0;
+        pwm_l2_ = 0;
+        pwm_swivel_ = 0;
+
+
+
+
+
+        double link1_error =
+            angle_error(
+                sim_l1_,
+                real_l1_
+            );
+
+        double link2_error =
+            angle_error(
+                sim_l2_,
+                real_l2_
+            );
+
+        double swivel_error =
+            angle_error(
+                sim_swivel_,
+                real_swivel_
+            );
+
+
+
+
+
+        if (
+            std::abs(link1_error) >
+            0.0
+        )
         {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Invalid ESP IP: %s",
-                ESP_IP);
+            link1_error_int_ +=
+                link1_error *
+                looptime_;
 
-            close(sender_socket_);
-            sender_socket_ = -1;
+            double p =
+                pid_const_link1_p_ *
+                link1_error;
 
-            return;
+            double i =
+                pid_const_link1_i_ *
+                link1_error_int_;
+
+            double d =
+                pid_const_link1_d_ *
+                (
+                    link1_error -
+                    link1_error_prev_
+                ) /
+                looptime_;
+
+            double pwm =
+                p + i + d;
+
+            pwm =
+                std::max(
+                    std::min(
+                        pwm,
+                        255.0
+                    ),
+                    -255.0
+                );
+
+            pwm =
+                std::round(pwm);
+
+
+            pwm = -pwm;
+
+            pwm_l1_ =
+                static_cast<int>(pwm);
+
+            link1_error_prev_ =
+                link1_error;
+        }
+        else
+        {
+            pwm_l1_ = 0;
         }
 
-        RCLCPP_INFO(
-            this->get_logger(),
-            "UDP sender -> %s:%d",
-            ESP_IP,
-            ESP_PORT);
 
-        auto last_log =
-            std::chrono::steady_clock::now();
 
-        while (rclcpp::ok() && running_.load())
+
+
+        if (
+            std::abs(link2_error) >
+            0.0
+        )
         {
-            std::string packet;
-            bool mode = autonomous_mode_.load();
+            link2_error_int_ +=
+                link2_error *
+                looptime_;
 
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
+            double p =
+                pid_const_link2_p_ *
+                link2_error;
 
-                if (!mode)
-                {
-                    std::string manual =
-                        last_manual_packet_.empty()
-                            ? "M0X0Y0P0Q0A0S0J0DE"
-                            : last_manual_packet_;
+            double i =
+                pid_const_link2_i_ *
+                link2_error_int_;
 
-                    packet =
-                        manual +
-                        "|L0R0T0U0G0E|Z0";
-                }
-                else
-                {
-                    std::string motor =
-                        last_motor_packet_.empty()
-                            ? "L0R0"
-                            : last_motor_packet_;
+            double d =
+                pid_const_link2_d_ *
+                (
+                    link2_error -
+                    link2_error_prev_
+                ) /
+                looptime_;
 
-                    std::string arm =
-                        last_arm_packet_.empty()
-                            ? "T0U0G0E"
-                            : last_arm_packet_ + "E";
+            double pwm =
+                p + i + d;
 
-                    packet =
-                        motor +
-                        arm +
-                        "|Z1";
-                }
-            }
+            pwm =
+                std::max(
+                    std::min(
+                        pwm,
+                        255.0
+                    ),
+                    -255.0
+                );
+
+            pwm =
+                std::round(pwm);
+
+
+            pwm = -pwm;
+
+            pwm_l2_ =
+                static_cast<int>(pwm);
+
+            link2_error_prev_ =
+                link2_error;
+        }
+        else
+        {
+            pwm_l2_ = 0;
+        }
+
+
+
+
+
+        if (
+            std::abs(swivel_error) >
+            0.0
+        )
+        {
+            swivel_error_int_ +=
+                swivel_error *
+                looptime_;
+
+            double p =
+                pid_const_swivel_p_ *
+                swivel_error;
+
+            double i =
+                pid_const_swivel_i_ *
+                swivel_error_int_;
+
+            double d =
+                pid_const_swivel_d_ *
+                (
+                    swivel_error -
+                    swivel_error_prev_
+                ) /
+                looptime_;
+
+            double pwm =
+                p + i + d;
+
+            pwm =
+                std::max(
+                    std::min(
+                        pwm,
+                        255.0
+                    ),
+                    -255.0
+                );
+
+            pwm =
+                std::round(pwm);
+
+
+
+
+
+            pwm = 0;
+
+            pwm_swivel_ = 0;
+
+            swivel_error_prev_ =
+                swivel_error;
+        }
+        else
+        {
+            pwm_swivel_ = 0;
+        }
+    }
+
+
+
+
+
+
+    std::string build_autonomous_packet()
+    {
+
+
+
+
+        update_arm_pid();
+
+        std::string packet =
+            ref_string_;
+
+
+
+
+
+        std::size_t pos =
+            packet.find("U0");
+
+        if (pos != std::string::npos)
+        {
+            packet.replace(
+                pos,
+                2,
+                "U" +
+                std::to_string(pwm_l1_)
+            );
+        }
+
+
+
+
+
+        pos =
+            packet.find("T0");
+
+        if (pos != std::string::npos)
+        {
+            packet.replace(
+                pos,
+                2,
+                "T" +
+                std::to_string(pwm_l2_)
+            );
+        }
+
+
+
+
+
+        pos =
+            packet.find("S0");
+
+        if (pos != std::string::npos)
+        {
+            packet.replace(
+                pos,
+                2,
+                "S" +
+                std::to_string(pwm_swivel_)
+            );
+        }
+
+
+
+
+
+        std::string motor_packet;
+
+        if (pwm_enabled_)
+        {
+            motor_packet =
+                format_motor_packet();
+        }
+        else
+        {
+            motor_packet = "L0R0";
+        }
+
+
+
+
+
+        pos =
+            packet.find("L0R0");
+
+        if (pos != std::string::npos)
+        {
+            packet.replace(
+                pos,
+                4,
+                motor_packet
+            );
+        }
+
+        return packet;
+    }
+
+
+
+
+
+
+    void send_pwm()
+    {
+
+
+
+
+        if (automate_)
+        {
+            send_string_ =
+                build_autonomous_packet();
+
+            std::cout
+                << "[AUTONOMOUS] TX: "
+                << send_string_
+                << std::endl;
 
             ssize_t sent =
                 sendto(
-                    sender_socket_,
-                    packet.c_str(),
-                    packet.size(),
+                    sock_tx_,
+                    send_string_.c_str(),
+                    send_string_.size(),
                     0,
-                    reinterpret_cast<sockaddr*>(&esp),
-                    sizeof(esp));
+                    reinterpret_cast<sockaddr*>(
+                        &tx_addr_
+                    ),
+                    sizeof(tx_addr_)
+                );
 
             if (sent < 0)
             {
-                RCLCPP_WARN_THROTTLE(
+                RCLCPP_ERROR(
                     this->get_logger(),
-                    *this->get_clock(),
-                    2000,
-                    "UDP send failed: %s",
-                    std::strerror(errno));
+                    "[AUTONOMOUS] UDP TX error: %s",
+                    std::strerror(errno)
+                );
             }
-
-            auto now =
-                std::chrono::steady_clock::now();
-
-            if (now - last_log >= 1s)
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "TX[%s] -> %s",
-                    mode ? "AUTO" : "MANUAL",
-                    packet.c_str());
-
-                last_log = now;
-            }
-
-            std::this_thread::sleep_for(50ms);
         }
 
-        if (sender_socket_ >= 0)
+
+
+
+
+        else
         {
-            close(sender_socket_);
-            sender_socket_ = -1;
+            char buffer[1024];
+
+            sockaddr_in sender_addr{};
+
+            socklen_t sender_len =
+                sizeof(sender_addr);
+
+            ssize_t received =
+                recvfrom(
+                    rx_sock_,
+                    buffer,
+                    sizeof(buffer) - 1,
+                    0,
+                    reinterpret_cast<sockaddr*>(
+                        &sender_addr
+                    ),
+                    &sender_len
+                );
+
+            if (received > 0)
+            {
+                buffer[received] = '\0';
+
+                std::string received_string(
+                    buffer
+                );
+
+
+
+
+
+                while (
+                    !received_string.empty() &&
+                    (
+                        received_string.back() ==
+                            '\n' ||
+                        received_string.back() ==
+                            '\r' ||
+                        received_string.back() ==
+                            ' '
+                    )
+                )
+                {
+                    received_string.pop_back();
+                }
+
+
+
+
+
+                std::cout
+                    << "[MANUAL] RX: "
+                    << received_string
+                    << std::endl;
+
+
+
+
+
+                char sender_ip[
+                    INET_ADDRSTRLEN
+                ];
+
+                inet_ntop(
+                    AF_INET,
+                    &sender_addr.sin_addr,
+                    sender_ip,
+                    INET_ADDRSTRLEN
+                );
+
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "[MANUAL] Packet from %s:%d: %s",
+                    sender_ip,
+                    ntohs(sender_addr.sin_port),
+                    received_string.c_str()
+                );
+
+
+
+
+
+                std::cout
+                    << "[MANUAL] TX: "
+                    << received_string
+                    << std::endl;
+
+                ssize_t sent =
+                    sendto(
+                        sock_tx_,
+                        received_string.c_str(),
+                        received_string.size(),
+                        0,
+                        reinterpret_cast<sockaddr*>(
+                            &tx_addr_
+                        ),
+                        sizeof(tx_addr_)
+                    );
+
+                if (sent < 0)
+                {
+                    RCLCPP_ERROR(
+                        this->get_logger(),
+                        "[MANUAL] UDP TX error: %s",
+                        std::strerror(errno)
+                    );
+                }
+            }
+            else if (
+                received < 0 &&
+                errno != EAGAIN &&
+                errno != EWOULDBLOCK
+            )
+            {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "[MANUAL] UDP RX error: %s",
+                    std::strerror(errno)
+                );
+            }
         }
     }
 
-    std::atomic<bool> running_{true};
-    std::atomic<bool> autonomous_mode_{false};
 
-    std::thread listener_thread_;
-    std::thread sender_thread_;
 
-    std::mutex mtx_;
 
-    std::string last_manual_packet_ =
-        "M0X0Y0P0Q0A0S0J0DE";
 
-    std::string last_motor_packet_ =
-        "L0R0";
 
-    std::string last_arm_packet_;
+    void stop_robot()
+    {
+        std::string stop_packet =
+            "M0L0R0T0U0S0G0Z0E";
 
-    int last_arm_data[3] = {0, 0, 0};
+        ssize_t sent =
+            sendto(
+                sock_tx_,
+                stop_packet.c_str(),
+                stop_packet.size(),
+                0,
+                reinterpret_cast<sockaddr*>(
+                    &tx_addr_
+                ),
+                sizeof(tx_addr_)
+            );
 
-    int listener_socket_ = -1;
-    int sender_socket_ = -1;
+        if (sent >= 0)
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "STOP packet sent."
+            );
+        }
+        else
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Failed to send stop packet: %s",
+                std::strerror(errno)
+            );
+        }
+    }
 
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
-        cmd_vel_sub_;
 
-    rclcpp::Subscription<aruco_msgs::msg::ArmPwm>::SharedPtr
-        arm_sub_;
 
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
-        mode_cmd_sub_;
 
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr
-        mode_state_pub_;
 
-    rclcpp::TimerBase::SharedPtr
-        mode_timer_;
 
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr
-        toggle_srv_;
+    ~ArmStateSubscriber()
+    {
+        if (sock_tx_ >= 0)
+        {
+            close(sock_tx_);
+            sock_tx_ = -1;
+        }
+
+        if (rx_sock_ >= 0)
+        {
+            close(rx_sock_);
+            rx_sock_ = -1;
+        }
+    }
+
+
+private:
+
+
+
+
+
+    int sock_tx_ = -1;
+    int rx_sock_ = -1;
+
+    std::string udp_ip_tx_;
+    int udp_port_tx_;
+
+    sockaddr_in tx_addr_{};
+
+
+
+
+
+    std::string ref_string_;
+    std::string send_string_;
+
+
+
+
+
+    bool automate_;
+
+    rclcpp::Service<
+        std_srvs::srv::Trigger
+    >::SharedPtr automation_service_;
+
+    rclcpp::Publisher<
+        std_msgs::msg::Bool
+    >::SharedPtr mode_state_pub_;
+
+
+
+
+
+    double looptime_;
+
+    rclcpp::TimerBase::SharedPtr timer_;
+
+
+
+
+
+    rclcpp::Subscription<
+        geometry_msgs::msg::Twist
+    >::SharedPtr cmd_vel_sub_;
+
+    rclcpp::Subscription<
+        aruco_msgs::msg::ArmPwm
+    >::SharedPtr virtualarm_;
+
+    rclcpp::Subscription<
+        aruco_msgs::msg::ArmPwm
+    >::SharedPtr realArm_;
+
+
+
+
+
+    double real_l1_;
+    double real_l2_;
+    double real_swivel_;
+
+    double sim_l1_;
+    double sim_l2_;
+    double sim_swivel_;
+
+    int64_t sim_gripper_;
+
+    bool gripperEngage_;
+
+
+
+
+
+    double link1_error_prev_;
+    double link1_error_int_;
+
+    double pid_const_link1_p_;
+    double pid_const_link1_i_;
+    double pid_const_link1_d_;
+
+    double link2_error_prev_;
+    double link2_error_int_;
+
+    double pid_const_link2_p_;
+    double pid_const_link2_i_;
+    double pid_const_link2_d_;
+
+    double swivel_error_prev_;
+    double swivel_error_int_;
+
+    double pid_const_swivel_p_;
+    double pid_const_swivel_i_;
+    double pid_const_swivel_d_;
+
+    int pwm_l1_;
+    int pwm_l2_;
+    int pwm_swivel_;
+
+
+
+
+
+    double linear_;
+    double angular_;
+
+    double left_;
+    double right_;
+
+    double left_rpm_;
+    double right_rpm_;
+
+    double left_pwm_;
+    double right_pwm_;
+
+    bool pwm_enabled_;
+
+    double max_linear_velocity_;
 };
 
-int main(int argc, char* argv[])
-{
-    rclcpp::init(argc, argv);
 
-    rclcpp::spin(
-        std::make_shared<RelayNode>());
+
+
+
+
+int main(
+    int argc,
+    char * argv[])
+{
+    rclcpp::init(
+        argc,
+        argv
+    );
+
+    auto node =
+        std::make_shared<
+            ArmStateSubscriber
+        >();
+
+    try
+    {
+        rclcpp::spin(node);
+    }
+    catch (
+        const rclcpp::exceptions::RCLError &
+    )
+    {
+
+    }
+    catch (
+        const std::exception &e
+    )
+    {
+        RCLCPP_ERROR(
+            node->get_logger(),
+            "Exception: %s",
+            e.what()
+        );
+    }
+
+    node->stop_robot();
 
     rclcpp::shutdown();
 

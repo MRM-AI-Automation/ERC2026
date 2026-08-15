@@ -13,6 +13,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArucoTag.msg"
   "msg/ImuData.msg"
   "msg/ArmPwm.msg"
+  "msg/ArmPosition.msg"
   DEPENDENCIES geometry_msgs
 )
 

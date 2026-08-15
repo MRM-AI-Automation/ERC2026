@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import serial
-import pynmea2
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -15,115 +15,259 @@ class GPSNode(Node):
     def __init__(self):
         super().__init__('gps_node')
 
-        self.declare_parameter('port', '/dev/ttyUSB0')
-        self.declare_parameter('baudrate', 115200)
+        self.port = '/dev/ttyAMA0'
+        self.baudrate = 115200
 
-        port = self.get_parameter('port').value
-        baudrate = self.get_parameter('baudrate').value
-
-        self.get_logger().info(
-            f'Starting GPS node on {port} @ {baudrate} baud'
-        )
-
-        try:
-            self.serial = serial.Serial(
-                port=port,
-                baudrate=baudrate,
-                timeout=1.0
-            )
-
-            self.get_logger().info('GPS serial connection opened')
-
-        except serial.SerialException as e:
-            self.get_logger().error(
-                f'Could not open GPS serial port: {e}'
-            )
-            raise
-
-        self.publisher = self.create_publisher(
+        self.gps_pub = self.create_publisher(
             NavSatFix,
-            '/gps/fix',
+            '/gps',
             10
         )
 
-        self.timer = self.create_timer(
+        self.last_data_time = time.monotonic()
+        self.last_fix_time = time.monotonic()
+
+        self.signal_lost = False
+        self.no_fix = False
+
+        try:
+            self.serial = serial.Serial(
+                self.port,
+                self.baudrate,
+                timeout=0.1
+            )
+
+            self.get_logger().info(
+                f'GPS serial opened: {self.port} @ {self.baudrate}'
+            )
+
+        except serial.SerialException as e:
+            self.get_logger().error(
+                f'Failed to open GPS serial port: {e}'
+            )
+            raise
+
+        self.read_timer = self.create_timer(
             0.01,
             self.read_gps
+        )
+
+        self.status_timer = self.create_timer(
+            1.0,
+            self.check_gps_status
         )
 
     def read_gps(self):
 
         try:
-            line = self.serial.readline().decode(
-                'ascii',
-                errors='ignore'
-            ).strip()
 
-            if not line:
-                return
+            while self.serial.in_waiting:
 
-            if not line.startswith('$'):
-                return
+                line = self.serial.readline().decode(
+                    'ascii',
+                    errors='ignore'
+                ).strip()
 
-            try:
-                msg = pynmea2.parse(line)
+                if not line:
+                    continue
 
-            except pynmea2.ParseError:
-                return
+                self.last_data_time = time.monotonic()
 
-            # GGA contains position + fix information
-            if isinstance(msg, pynmea2.types.talker.GGA):
-
-                if msg.latitude is None or msg.longitude is None:
-                    return
-
-                fix = NavSatFix()
-
-                fix.header.stamp = self.get_clock().now().to_msg()
-                fix.header.frame_id = 'gps_link'
-
-                # Fix status
-                if msg.gps_qual is not None and int(msg.gps_qual) > 0:
-                    fix.status.status = (
-                        NavSatStatus.STATUS_FIX
-                    )
-                else:
-                    fix.status.status = (
-                        NavSatStatus.STATUS_NO_FIX
-                    )
-
-                fix.status.service = (
-                    NavSatStatus.SERVICE_GPS
-                )
-
-                # Position
-                fix.latitude = float(msg.latitude)
-                fix.longitude = float(msg.longitude)
-
-                # Altitude
-                if msg.altitude:
-                    fix.altitude = float(msg.altitude)
-                else:
-                    fix.altitude = 0.0
-
-                self.publisher.publish(fix)
-
-                self.get_logger().info(
-                    f'GPS: '
-                    f'lat={fix.latitude:.8f}, '
-                    f'lon={fix.longitude:.8f}, '
-                    f'alt={fix.altitude:.2f} m'
-                )
+                if (
+                    line.startswith('$GNGGA')
+                    or line.startswith('$GPGGA')
+                ):
+                    self.parse_gga(line)
 
         except serial.SerialException as e:
+
             self.get_logger().error(
-                f'Serial error: {e}'
+                f'GPS serial error: {e}'
             )
 
         except Exception as e:
+
             self.get_logger().error(
-                f'GPS processing error: {e}'
+                f'GPS read error: {e}'
             )
+
+    def parse_gga(self, line):
+
+        try:
+
+            data = line.split('*')[0]
+            fields = data.split(',')
+
+            if len(fields) < 10:
+                return
+
+            lat_raw = fields[2]
+            lat_dir = fields[3]
+
+            lon_raw = fields[4]
+            lon_dir = fields[5]
+
+            fix_type = int(fields[6]) if fields[6] else 0
+
+            satellites = (
+                int(fields[7])
+                if fields[7]
+                else 0
+            )
+
+            altitude = (
+                float(fields[9])
+                if fields[9]
+                else 0.0
+            )
+
+            fix_name = self.get_fix_name(fix_type)
+
+            # No GPS position
+            if fix_type == 0 or not lat_raw or not lon_raw:
+
+                if not self.no_fix:
+
+                    self.get_logger().warn(
+                        f'NO GPS FIX | '
+                        f'Fix: {fix_name} ({fix_type}) | '
+                        f'Satellites: {satellites}'
+                    )
+
+                    self.no_fix = True
+
+                return
+
+            # GPS fix recovered
+            if self.no_fix:
+
+                self.get_logger().info(
+                    'GPS FIX RECOVERED'
+                )
+
+                self.no_fix = False
+
+            latitude = self.nmea_to_decimal(
+                lat_raw,
+                lat_dir
+            )
+
+            longitude = self.nmea_to_decimal(
+                lon_raw,
+                lon_dir
+            )
+
+            msg = NavSatFix()
+
+            msg.header.stamp = (
+                self.get_clock().now().to_msg()
+            )
+
+            msg.header.frame_id = 'gps_link'
+
+            msg.status.service = (
+                NavSatStatus.SERVICE_GPS
+            )
+
+            msg.status.status = (
+                NavSatStatus.STATUS_FIX
+            )
+
+            msg.latitude = latitude
+            msg.longitude = longitude
+            msg.altitude = altitude
+
+            msg.position_covariance_type = (
+                NavSatFix.COVARIANCE_TYPE_UNKNOWN
+            )
+
+            self.gps_pub.publish(msg)
+
+            self.last_fix_time = time.monotonic()
+
+            self.get_logger().info(
+                f'GPS | '
+                f'Lat: {latitude:.8f} | '
+                f'Lon: {longitude:.8f} | '
+                f'Alt: {altitude:.3f} m | '
+                f'Fix: {fix_name} ({fix_type}) | '
+                f'Sats: {satellites}'
+            )
+
+        except (ValueError, IndexError) as e:
+
+            self.get_logger().warn(
+                f'Invalid GGA sentence: {e}'
+            )
+
+    def check_gps_status(self):
+
+        elapsed = (
+            time.monotonic() -
+            self.last_data_time
+        )
+
+        # No serial GPS data for 2 seconds
+        if elapsed > 2.0:
+
+            if not self.signal_lost:
+
+                self.get_logger().error(
+                    'GPS SIGNAL LOST - '
+                    'No data received from receiver'
+                )
+
+                self.signal_lost = True
+
+        else:
+
+            if self.signal_lost:
+
+                self.get_logger().info(
+                    'GPS SIGNAL RESTORED'
+                )
+
+                self.signal_lost = False
+
+    @staticmethod
+    def nmea_to_decimal(value, direction):
+
+        if direction in ['N', 'S']:
+
+            degrees = int(value[:2])
+            minutes = float(value[2:])
+
+        else:
+
+            degrees = int(value[:3])
+            minutes = float(value[3:])
+
+        decimal = degrees + minutes / 60.0
+
+        if direction in ['S', 'W']:
+            decimal *= -1.0
+
+        return decimal
+
+    @staticmethod
+    def get_fix_name(fix_type):
+
+        fix_names = {
+            0: 'NO FIX',
+            1: 'GNSS FIX',
+            2: 'DGPS',
+            3: 'PPS',
+            4: 'RTK FIXED',
+            5: 'RTK FLOAT',
+            6: 'DR',
+            7: 'MANUAL',
+            8: 'SIMULATION'
+        }
+
+        return fix_names.get(
+            fix_type,
+            'UNKNOWN'
+        )
 
 
 def main(args=None):
@@ -133,12 +277,14 @@ def main(args=None):
     node = GPSNode()
 
     try:
+
         rclpy.spin(node)
 
     except KeyboardInterrupt:
         pass
 
     finally:
+
         node.serial.close()
         node.destroy_node()
         rclpy.shutdown()

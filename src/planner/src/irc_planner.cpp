@@ -805,39 +805,92 @@ namespace planner
 {
     auto clock = this->get_clock();
 
-    if (!last_lidar_scan_) {
+    if (!last_lidar_scan_)
+    {
         obstacle_detect = false;
+        obs_x = 0.0f;
+        obs_y = 0.0f;
         return;
     }
 
     bool found = false;
     float best_x = std::numeric_limits<float>::max();
-    float x = 0.0f, y = 0.0f;
+    float x = 0.0f;
+    float y = 0.0f;
 
-    constexpr float min_x = 0.5f;
-    constexpr float max_x = 3.0f;
-    constexpr float half_w = 0.40f;
+    // Obstacle detection region
+    constexpr float min_x = 0.4f;
+    constexpr float max_x = 2.0f;
+    constexpr float half_w = 1.20f;
+
+    // Ignore LiDAR points around the TARGET ArUco only
+    constexpr float aruco_mask_radius = 0.40f;
 
     const auto& scan = *last_lidar_scan_;
+
     float angle = scan.angle_min;
 
-    for (size_t i = 0; i < scan.ranges.size(); ++i, angle += scan.angle_increment)
+    for (size_t i = 0; i < scan.ranges.size(); ++i,
+         angle += scan.angle_increment)
     {
-        float r = scan.ranges[i];
+        const float r = scan.ranges[i];
 
+        // Invalid LiDAR measurement
         if (r < scan.range_min || r > scan.range_max)
             continue;
+
         if (!std::isfinite(r))
             continue;
 
-        // Convert polar to Cartesian (laser frame: x forward, y left)
-        float px = r * std::cos(angle);
-        float py = r * std::sin(angle);
+        // Convert LiDAR polar coordinates to Cartesian
+        // x = forward
+        // y = left
+        const float px = r * std::cos(angle);
+        const float py = r * std::sin(angle);
 
-        if (px < min_x || px > max_x) continue;
-        if (std::abs(py) > half_w) continue;
+        /*
+         * ============================================================
+         * TARGET ARUCO MASK
+         * ============================================================
+         *
+         * aruco_detect is only true when:
+         *
+         *     msg->id == target_aruco_id_
+         *
+         * Therefore this mask ONLY applies to the ArUco we are
+         * currently trying to follow.
+         *
+         * Other ArUco IDs are NOT masked and remain obstacles.
+         */
+        if (aruco_detect)
+        {
+            const float dx =
+                px - static_cast<float>(aruco_x);
 
-        if (px < best_x) {
+            const float dy =
+                py - static_cast<float>(aruco_y);
+
+            const float distance_to_target =
+                std::sqrt(dx * dx + dy * dy);
+
+            if (distance_to_target < aruco_mask_radius)
+            {
+                // This LiDAR point belongs to the target ArUco region.
+                // Ignore it as an obstacle.
+                continue;
+            }
+        }
+
+        // Keep only the forward obstacle detection region
+        if (px < min_x || px > max_x)
+            continue;
+
+        if (std::abs(py) > half_w)
+            continue;
+
+        // Find the closest remaining obstacle
+        if (px < best_x)
+        {
             best_x = px;
             x = px;
             y = py;
@@ -845,22 +898,42 @@ namespace planner
         }
     }
 
+    // Update obstacle state
     obstacle_detect = found;
-    obs_x = x;
-    obs_y = y;
 
-    if (obstacle_detect)
+    if (found)
     {
+        obs_x = x;
+        obs_y = y;
+
         const float dist = std::hypot(obs_x, obs_y);
+
         const char *side =
             (obs_y > 0.15f) ? "left" :
             (obs_y < -0.15f) ? "right" :
                                "center";
 
         RCLCPP_INFO_THROTTLE(
-            get_logger(), *clock, 300,
-            "[OBS] Obstacle detected | x=%.2f y=%.2f dist=%.2f side=%s",
-            obs_x, obs_y, dist, side);
+            get_logger(),
+            *clock,
+            300,
+            "[OBS] Obstacle detected | "
+            "x=%.2f y=%.2f dist=%.2f side=%s",
+            obs_x,
+            obs_y,
+            dist,
+            side);
+    }
+    else
+    {
+        obs_x = 0.0f;
+        obs_y = 0.0f;
+
+        RCLCPP_INFO_THROTTLE(
+            get_logger(),
+            *clock,
+            1000,
+            "[OBS] No obstacle");
     }
 }
 

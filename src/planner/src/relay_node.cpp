@@ -451,7 +451,7 @@ public:
 
 
         linear_ =
-            msg->linear.x * 1.2;
+           - msg->linear.x * 1.2;
 
         angular_ =
             -msg->angular.z * 1.2;

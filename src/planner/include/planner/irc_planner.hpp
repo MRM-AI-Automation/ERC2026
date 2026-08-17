@@ -21,9 +21,9 @@
 namespace planner
 {
 
-constexpr double kRoverLength  = 1.50;
+constexpr double kRoverLength = 1.50;
 constexpr double kRoverBreadth = 1.25;
-constexpr double kMaxLinearVel  = 1.0;
+constexpr double kMaxLinearVel = 1.0;
 constexpr double kMaxAngularVel = 1.5;
 constexpr double kDistanceThreshold = 2.0;
 
@@ -34,7 +34,8 @@ enum State
     kCoordinateFollowing,
     kSearchPattern,
     kArucoFollowing,
-    kObstacleAvoidance
+    kObstacleAvoidance,
+    kGPSObstacleAvoidance
 };
 
 enum SearchPattern
@@ -47,8 +48,8 @@ enum SearchPattern
 
 enum SearchSkew
 {
-    kNoSkew    = 0,
-    kLeftSkew  = -1,
+    kNoSkew = 0,
+    kLeftSkew = -1,
     kRightSkew = 1
 };
 
@@ -67,15 +68,11 @@ private:
 
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr vel_pub;
 
-
     rclcpp::Subscription<aruco_msgs::msg::ImuData>::SharedPtr imu_sub_;
     rclcpp::Subscription<aruco_msgs::msg::ImuData>::SharedPtr external_imu_sub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_sub_;
     rclcpp::Subscription<aruco_msgs::msg::ArucoTag>::SharedPtr aruco_sub_;
-
-    // LiDAR subscriber
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr lidar_sub_;
-
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr auto_sub_;
 
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr toggle_client_;
@@ -98,6 +95,9 @@ private:
     Coordinates curr_location;
     Coordinates goal_location;
     rclcpp::Time last_gps_time_;
+
+    bool gps_wall_following_active_{false};
+    double gps_wall_target_distance_{0.0};
 
     bool aruco_detect;
     bool aruco_goal_reached;
@@ -129,8 +129,6 @@ private:
 
     std::mutex state_mutex_;
 
- 
-
     bool obstacle_clear_timing_{false};
     rclcpp::Time obstacle_clear_since_;
 
@@ -141,7 +139,6 @@ private:
     bool search_timing_;
     double search_offset_deg_;
 
-    // Latest LiDAR scan
     sensor_msgs::msg::LaserScan::SharedPtr last_lidar_scan_;
 
     void stackRun();
@@ -150,17 +147,13 @@ private:
     void imuCallback(const aruco_msgs::msg::ImuData::SharedPtr msg);
     void externalImuCallback(const aruco_msgs::msg::ImuData::SharedPtr msg);
     void gpsCallback(const sensor_msgs::msg::NavSatFix::SharedPtr fix);
-
-    // LiDAR callback
     void lidarCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan_msg);
-
-    // ArUco callback
     void arucoCallback(const aruco_msgs::msg::ArucoTag::SharedPtr msg);
-
     void stateCallback(const std_msgs::msg::Bool::SharedPtr state);
 
     void coordinateFollowing();
     void obstacleAvoidance();
+    void gpsObstacleAvoidance();
     void arucoFollowing();
     void callSearchPattern();
     void navigationModeSelect();

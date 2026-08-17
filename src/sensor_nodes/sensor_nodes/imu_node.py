@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from custom_msgs.msg import ImuData
+from aruco_msgs.msg import ImuData
 from geometry_msgs.msg import Vector3
 
 
@@ -28,7 +28,7 @@ class BNO055Node(Node):
         self.timer_ = self.create_timer(0.01, self.publish_imu)
 
     def initialize_imu(self):
-        self.serial_port = serial.Serial('/dev/ttyUSB1', 115200)
+        self.serial_port = serial.Serial('/dev/ttyUSB0', 115200)
         time.sleep(1)
         if(self.serial_port):
             print("into the serial port1")
@@ -42,7 +42,7 @@ class BNO055Node(Node):
         time.sleep(0.1)
         self.serial_port.dtr = True 
         self.serial_port.close()
-        self.serial_port = serial.Serial('/dev/ttyUSB1', 115200)
+        self.serial_port = serial.Serial('/dev/ttyUSB0', 115200)
         time.sleep(1)
         if(self.serial_port):
             print("into the serial port reseted")

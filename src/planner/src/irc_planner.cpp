@@ -1,3 +1,4 @@
+
 #include "planner/irc_planner.hpp"
 
 #include <algorithm>
@@ -330,12 +331,14 @@ void SensorCallback::coordinateFollowing()
 
         publishVel(stop_cmd);
 
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "[GPS] GPS data stale -> rover stopped");
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "[GPS] GPS data stale -> rover stopped");
         return;
     }
 
     // -----------------------------------------------------
-    // Calculate distance using Haversine
+    // Calculate distance
     // -----------------------------------------------------
     const double dist = haversine(curr_location, goal_location);
 
@@ -343,7 +346,10 @@ void SensorCallback::coordinateFollowing()
     {
         if (!gps_goal_reached)
         {
-            RCLCPP_INFO(get_logger(), "[GPS] GOAL REACHED | Distance: %.2f m", dist);
+            RCLCPP_INFO(
+                get_logger(),
+                "[GPS] GOAL REACHED | Distance: %.2f m",
+                dist);
         }
 
         gps_goal_reached = true;
@@ -357,23 +363,26 @@ void SensorCallback::coordinateFollowing()
     gps_goal_reached = false;
 
     // -----------------------------------------------------
-    // Calculate target bearing and 0-360 heading error
+    // Calculate target bearing and SIGNED heading error
     // -----------------------------------------------------
-    const double target_bearing = gpsBearing(curr_location, goal_location);
-    const double error = headingError(target_bearing, imu_yaw);
+    const double target_bearing =
+        gpsBearing(curr_location, goal_location);
 
-    // Shortest angular distance for tolerance checking
-    const double shortest_error = std::min(error, 360.0 - error);
+    const double error =
+        headingError(target_bearing, imu_yaw);
+
+    // Absolute value is used only to check alignment tolerance
+    const double shortest_error = std::abs(error);
 
     RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1000,
         "[GPS] Distance: %.2f m | Target: %.1f deg | Current: %.1f deg | Error: %.1f deg",
-        dist, target_bearing, imu_yaw, shortest_error);
+        dist, target_bearing, imu_yaw, error);
 
     constexpr double HEADING_TOLERANCE = 10.0;
     constexpr double WAIT_TIME = 2.0;
     constexpr double CHECK_TIME = 2.0;
-    constexpr double TURN_SPEED = 0.5;
+    constexpr double TURN_SPEED = 2.0;
 
     geometry_msgs::msg::Twist cmd;
 
@@ -386,7 +395,8 @@ void SensorCallback::coordinateFollowing()
         {
             gps_aligned_ = true;
             gps_waiting_ = true;
-            gps_wait_end_ = now + rclcpp::Duration::from_seconds(WAIT_TIME);
+            gps_wait_end_ =
+                now + rclcpp::Duration::from_seconds(WAIT_TIME);
 
             publishVel(stop_cmd);
             return;
@@ -394,16 +404,15 @@ void SensorCallback::coordinateFollowing()
 
         cmd.linear.x = 0.0;
 
-        // error 0-180: turn toward target one way
-        // error 180-360: turn the opposite way
+        // Your rover convention:
+        // negative angular.z = RIGHT
+        // positive angular.z = LEFT
         //
-        // Negative angular.z turns this rover right,
-        // so the command direction follows the existing
-        // rover convention.
-        if (error <= 180.0)
-            cmd.angular.z = -TURN_SPEED;
+        // Positive signed error means target is clockwise/right.
+        if (error > 0.0)
+            cmd.angular.z = -TURN_SPEED;  // RIGHT
         else
-            cmd.angular.z = TURN_SPEED;
+            cmd.angular.z = TURN_SPEED;   // LEFT
 
         publishVel(cmd);
         return;
@@ -416,9 +425,10 @@ void SensorCallback::coordinateFollowing()
     {
         publishVel(stop_cmd);
 
-        if (now < gps_wait_end_) return;
+        if (now < gps_wait_end_)
+            return;
 
-        // Still within 10 degrees after waiting
+        // Recheck heading after waiting
         if (shortest_error > HEADING_TOLERANCE)
         {
             gps_aligned_ = false;
@@ -447,15 +457,17 @@ void SensorCallback::coordinateFollowing()
 
             publishVel(stop_cmd);
 
-            RCLCPP_WARN(get_logger(), "[GPS] Heading lost -> realigning");
+            RCLCPP_WARN(
+                get_logger(),
+                "[GPS] Heading lost -> realigning");
             return;
         }
     }
 
-    // Heading is acceptable: drive straight
-    const double speed = std::clamp(0.25 + (0.10 * dist), 0.25, 1.0);
-
-    cmd.linear.x = speed;
+    // =====================================================
+    // Heading is good: drive straight
+    // =====================================================
+    cmd.linear.x = 1.8;
     cmd.angular.z = 0.0;
 
     publishVel(cmd);
@@ -822,11 +834,10 @@ double SensorCallback::gpsBearing(Coordinates curr, Coordinates dest)
 
 double SensorCallback::headingError(double target, double current)
 {
-    double error = std::fmod(target - current + 360.0, 360.0);
-
-    if (error < 0.0) error += 360.0;
-
-    return error;
+    // Signed shortest angular error in degrees: [-180, +180)
+    // Positive = target is clockwise/right of current heading
+    // Negative = target is counter-clockwise/left of current heading
+    return std::fmod(target - current + 540.0, 360.0) - 180.0;
 }
 
 } // namespace planner

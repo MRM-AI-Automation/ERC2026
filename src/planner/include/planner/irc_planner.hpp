@@ -19,13 +19,13 @@
 namespace planner
 {
 
-constexpr double kMaxLinearVel = 1.0;
-constexpr double kMaxAngularVel = 1.5;
+constexpr double kMaxLinearVel = 5.0;
+constexpr double kMaxAngularVel = 5.0;
 
 constexpr double kMinLinearVel = 0.0;
 constexpr double kMinAngularVel = 0.0;
 
-constexpr double kDistanceThreshold = 1.5;
+constexpr double kDistanceThreshold = 1.0;
 constexpr double kHeadingTolerance = 10.0;
 constexpr double kAlignWaitSec = 2.0;
 

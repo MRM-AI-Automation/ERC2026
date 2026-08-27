@@ -16,7 +16,7 @@ class GPSNode(Node):
         super().__init__('gps_node')
 
         self.port = '/dev/ttyACM0'
-        self.baudrate = 115200
+        self.baudrate = 38400
 
         self.gps_pub = self.create_publisher(
             NavSatFix,

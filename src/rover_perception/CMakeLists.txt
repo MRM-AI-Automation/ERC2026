@@ -11,7 +11,7 @@ find_package(rclpy REQUIRED)
 
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
-find_package(aruco_msgs REQUIRED)
+find_package(msgs REQUIRED)
 
 find_package(laser_geometry REQUIRED)
 find_package(tf2 REQUIRED)

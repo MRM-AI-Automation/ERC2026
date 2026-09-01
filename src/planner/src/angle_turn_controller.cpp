@@ -1,6 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
-#include <aruco_msgs/msg/imu_data.hpp>
+#include <msgs/msg/imu_data.hpp>
 
 #include <cmath>
 #include <memory>
@@ -22,7 +22,7 @@ public:
         angular_speed_ = 2.0;
 
         // Subscribe to IMU
-        imu_sub_ = this->create_subscription<aruco_msgs::msg::ImuData>(
+        imu_sub_ = this->create_subscription<msgs::msg::ImuData>(
             "/imu_data",
             10,
             std::bind(
@@ -120,7 +120,7 @@ private:
 
 
     void imuCallback(
-        const aruco_msgs::msg::ImuData::SharedPtr msg)
+        const msgs::msg::ImuData::SharedPtr msg)
     {
         // orientation.z = yaw
         double current_angle_deg =
@@ -226,7 +226,7 @@ private:
 
 
     // ROS interfaces
-    rclcpp::Subscription<aruco_msgs::msg::ImuData>::SharedPtr imu_sub_;
+    rclcpp::Subscription<msgs::msg::ImuData>::SharedPtr imu_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
 
     // Controller settings

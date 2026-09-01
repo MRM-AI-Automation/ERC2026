@@ -1,4 +1,3 @@
-
 #include "planner/irc_planner.hpp"
 
 #include <algorithm>
@@ -12,21 +11,24 @@ namespace planner
 SensorCallback::SensorCallback()
 : Node("planner_node"),
   vel_pub(nullptr), imu_sub_(nullptr), gps_sub_(nullptr), aruco_sub_(nullptr),
-  lidar_sub_(nullptr), auto_sub_(nullptr), toggle_client_(nullptr), stack_timer_(nullptr),
-  CurrState(kManualState), FollowPattern(kMoveForward), nav_mode(-1),
+  pointcloud_sub_(nullptr), auto_sub_(nullptr), toggle_client_(nullptr), stack_timer_(nullptr),
+  // MANUAL MODE DISABLED: start directly in navigation selection.
+  CurrState(kNavigationModeSelect), FollowPattern(kMoveForward), nav_mode(-1),
   target_aruco_id_(0), nav_select_done_(false), rover_state(false), last_rover_state(false),
   gps_goal_set(false), gps_goal_reached(false), gps_aligned_(false),
   curr_location{0.0, 0.0}, goal_location{0.0, 0.0}, imu_yaw(0.0),
   aruco_detect(false), aruco_goal_reached(false), aruco_x(0.0), aruco_y(0.0),
   obstacle_detect(false), obs_x(0.0), obs_y(0.0),
+  last_point_cloud_(nullptr), last_pointcloud_time_(this->now()),
   search_ref_set_(false), spot_turn_back_(false), spot_done_(false), search_cycle_(0),
   search_end_time_(this->now()), search_forward_time_(4.0), search_skew(kNoSkew),
-  avoiding_obstacle_(false), prev_state_(kManualState), prev_search_pattern_(kMoveForward)
+  avoiding_obstacle_(false), prev_state_(kNavigationModeSelect), prev_search_pattern_(kMoveForward),
+  gps_avoiding_(false), gps_avoid_direction_(0), gps_avoid_moving_forward_(false)
 {
     declare_parameter("imu_topic", "/imu_data");
     declare_parameter("gps_topic", "/gps");
     declare_parameter("aruco_topic", "/aruco_detected");
-    declare_parameter("lidar_topic", "/scan");
+    declare_parameter("pointcloud_topic", "/local_grid_obstacle");
     declare_parameter("cmd_vel_topic", "/cmd_vel");
     declare_parameter("state_topic", "/autonomous_mode_state");
     declare_parameter("target_aruco_id", 1);
@@ -34,21 +36,25 @@ SensorCallback::SensorCallback()
     const auto imu_topic = get_parameter("imu_topic").as_string();
     const auto gps_topic = get_parameter("gps_topic").as_string();
     const auto aruco_topic = get_parameter("aruco_topic").as_string();
-    const auto lidar_topic = get_parameter("lidar_topic").as_string();
+    const auto pointcloud_topic = get_parameter("pointcloud_topic").as_string();
     const auto cmd_vel = get_parameter("cmd_vel_topic").as_string();
-    const auto state_topic = get_parameter("state_topic").as_string();
+    // state_topic intentionally unused: manual/autonomous switching is disabled.
 
     target_aruco_id_ = get_parameter("target_aruco_id").as_int();
 
     vel_pub = create_publisher<geometry_msgs::msg::Twist>(cmd_vel, 10);
-    imu_sub_ = create_subscription<aruco_msgs::msg::ImuData>(imu_topic, 10,std::bind(&SensorCallback::imuCallback, this, std::placeholders::_1));
+    imu_sub_ = create_subscription<msgs::msg::ImuData>(imu_topic,10,std::bind(&SensorCallback::imuCallback, this, std::placeholders::_1));
     gps_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(gps_topic, 10, std::bind(&SensorCallback::gpsCallback, this, std::placeholders::_1));
-    aruco_sub_ = create_subscription<aruco_msgs::msg::ArucoTag>(aruco_topic, 10, std::bind(&SensorCallback::arucoCallback, this, std::placeholders::_1));
-    lidar_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(lidar_topic, 10, std::bind(&SensorCallback::lidarCallback, this, std::placeholders::_1));
-    auto_sub_ = create_subscription<std_msgs::msg::Bool>(state_topic, 10, std::bind(&SensorCallback::stateCallback, this, std::placeholders::_1));
+    aruco_sub_ = create_subscription<msgs::msg::ArucoTag>(aruco_topic, 10, std::bind(&SensorCallback::arucoCallback, this, std::placeholders::_1));
+    pointcloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(pointcloud_topic, rclcpp::SensorDataQoS(),std::bind(&SensorCallback::pointCloudCallback, this, std::placeholders::_1));
+    // MANUAL MODE DISABLED:
+    // auto_sub_ = create_subscription<std_msgs::msg::Bool>(
+    //     state_topic, 10,
+    //     std::bind(&SensorCallback::stateCallback, this, std::placeholders::_1));
 
     stack_timer_ = create_wall_timer(std::chrono::milliseconds(50), std::bind(&SensorCallback::stackRun, this));
-    toggle_client_ = create_client<std_srvs::srv::Trigger>("/toggle_autonomous");
+    // MANUAL MODE DISABLED:
+    // toggle_client_ = create_client<std_srvs::srv::Trigger>("/toggle_autonomous");
 
     last_gps_time_ = this->now();
     last_aruco_time_ = this->now();
@@ -57,81 +63,304 @@ SensorCallback::SensorCallback()
 
 void SensorCallback::stackRun()
 {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    auto now = this->get_clock()->now();
+    // =====================================================
+    // MANUAL MODE DISABLED
+    // =====================================================
+    // Autonomous execution is no longer gated by rover_state.
+    // The node runs autonomous navigation continuously.
+    //
+    const auto now = get_clock()->now();
 
-    if (last_lidar_scan_) obstacleClassifier();
-    if ((now - last_aruco_time_).seconds() > 0.9) aruco_detect = false;
-
-    if (!rover_state)
+    // =====================================================
+    // GPS GOAL CHECK HAS ABSOLUTE PRIORITY
+    //
+    // This must happen BEFORE obstacle avoidance and BEFORE
+    // the state machine. Otherwise GPS obstacle avoidance
+    // can continue moving after the rover reaches the goal.
+    // =====================================================
+    if (nav_mode == 0 &&
+        gps_goal_set &&
+        !gps_goal_reached)
     {
-        publishVel(geometry_msgs::msg::Twist());
+        const double gps_dist =
+            haversine(curr_location, goal_location);
+
+        if (gps_dist <= kDistanceThreshold)
+        {
+            gps_goal_reached = true;
+            gps_goal_set = false;
+
+            // Cancel every GPS movement state immediately
+            gps_aligned_ = false;
+            gps_waiting_ = false;
+            gps_avoiding_ = false;
+            gps_avoid_moving_forward_ = false;
+            gps_avoid_direction_ = 0;
+
+            // STOP BEFORE changing modes
+            hardStop();
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[GPS] GOAL REACHED -> STOPPED | Distance: %.2f m",
+                gps_dist);
+
+            // MANUAL MODE DISABLED:
+            // Do not switch to manual or toggle the external mode.
+            // gps_goal_reached + gps_goal_set=false keep navigation stopped.
+            return;
+        }
+    }
+
+    // =====================================================
+    // ARUCO FRESHNESS
+    // =====================================================
+    constexpr double ARUCO_TIMEOUT = 0.5;
+
+    if (aruco_detect &&
+        (now - last_aruco_time_).seconds() > ARUCO_TIMEOUT)
+    {
+        aruco_detect = false;
+
+        RCLCPP_INFO_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            1000,
+            "[ARUCO] Marker lost");
+    }
+
+    // =====================================================
+    // UPDATE OBSTACLE INFORMATION
+    // =====================================================
+    obstacleClassifier();
+
+    // =====================================================
+    // ARUCO STATE TRANSITIONS
+    // =====================================================
+    if (nav_mode == 1 && CurrState != kObstacleAvoidance)
+    {
+        if (CurrState == kSearchPattern && aruco_detect)
+        {
+            hardStop();
+            CurrState = kArucoFollowing;
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[ARUCO] Target detected -> switching to ArUco following");
+
+            return;
+        }
+
+        if (CurrState == kArucoFollowing && !aruco_detect)
+        {
+            hardStop();
+            resetSearchPattern();
+            CurrState = kSearchPattern;
+
+            RCLCPP_WARN(
+                get_logger(),
+                "[ARUCO] Target lost -> returning to search pattern");
+
+            return;
+        }
+    }
+
+    // =====================================================
+    // ARUCO GOAL CHECK HAS ABSOLUTE PRIORITY
+    // =====================================================
+    if (nav_mode == 1 &&
+        CurrState == kArucoFollowing &&
+        aruco_detect &&
+        aruco_x >= 0.0 &&
+        aruco_x <= kDistanceThreshold)
+    {
+        if (!aruco_goal_reached)
+        {
+            aruco_goal_reached = true;
+            hardStop();
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[ARUCO] GOAL REACHED -> STOPPED | Distance: %.2f m",
+                aruco_x);
+        }
+
+        // MANUAL MODE DISABLED:
+        // Remain in autonomous code; the goal-reached safety check
+        // below will keep publishing zero velocity.
         return;
     }
 
-    if (CurrState == kNavigationModeSelect)
+    // =====================================================
+    // ARUCO GOAL REACHED SAFETY CHECK
+    // =====================================================
+    if (nav_mode == 1 && aruco_goal_reached)
     {
-        navigationModeSelect();
+        hardStop();
         return;
     }
 
-    if (nav_mode == 0 && !gps_goal_set) return;
-    if (nav_mode == 1 && CurrState == kSearchPattern && target_aruco_id_ <= 0) return;
+    // =====================================================
+    // ARUCO OBSTACLE AVOIDANCE
+    // =====================================================
+    const bool aruco_searching_forward =
+        nav_mode == 1 &&
+        CurrState == kSearchPattern &&
+        FollowPattern == kMoveForward &&
+        !spot_turn_back_;
 
-    RoverStateClassifier();
-    setGoalStatus();
+    const bool aruco_following =
+        nav_mode == 1 &&
+        CurrState == kArucoFollowing;
 
-    // ArUco obstacle avoidance remains unchanged
-    if (nav_mode == 1 && obstacle_detect && CurrState != kObstacleAvoidance)
+    const bool obstacle_before_aruco =
+        aruco_following &&
+        aruco_detect &&
+        obstacle_detect &&
+        aruco_x > 0.0 &&
+        obs_x > 0.0 &&
+        static_cast<double>(obs_x) < aruco_x;
+
+    const bool avoid_during_search =
+        aruco_searching_forward &&
+        obstacle_detect;
+
+    if ((avoid_during_search || obstacle_before_aruco) &&
+        CurrState != kObstacleAvoidance)
     {
+        avoiding_obstacle_ = true;
         prev_state_ = CurrState;
         prev_search_pattern_ = FollowPattern;
+
+        hardStop();
         CurrState = kObstacleAvoidance;
 
-        RCLCPP_WARN(get_logger(), "[ARUCO] OBSTACLE DETECTED -> OBSTACLE AVOIDANCE");
+        RCLCPP_WARN(
+            get_logger(),
+            "[ARUCO OA] STOPPED -> entering obstacle avoidance");
+
+        return;
     }
 
-    // GPS obstacle avoidance state exists as a placeholder,
-    // but GPS navigation does not enter it yet.
+    // =====================================================
+    // TARGET IS BEFORE THE OBSTACLE -> IGNORE OBSTACLE
+    // =====================================================
+    if (aruco_following &&
+        aruco_detect &&
+        obstacle_detect &&
+        aruco_x > 0.0 &&
+        obs_x > 0.0 &&
+        aruco_x <= static_cast<double>(obs_x))
+    {
+        RCLCPP_INFO_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            1000,
+            "[ARUCO] Target at %.2f m is before obstacle at %.2f m "
+            "-> continuing ArUco following",
+            aruco_x,
+            obs_x);
+    }
 
+    // =====================================================
+    // GPS OBSTACLE AVOIDANCE
+    //
+    // GPS goal has already been checked above, so we cannot
+    // enter avoidance after reaching the goal.
+    // =====================================================
+    if (nav_mode == 0 &&
+        obstacle_detect &&
+        CurrState == kCoordinateFollowing &&
+        gps_aligned_ &&
+        !gps_waiting_ &&
+        gps_goal_set &&
+        !gps_goal_reached)
+    {
+        const double goal_distance =
+            haversine(curr_location, goal_location);
+
+        const double obstacle_distance =
+            static_cast<double>(obs_x);
+
+        if (goal_distance > obstacle_distance)
+        {
+            gps_avoiding_ = true;
+            gps_avoid_direction_ = 0;
+            gps_avoid_moving_forward_ = false;
+
+            gps_aligned_ = false;
+            gps_waiting_ = false;
+
+            hardStop();
+            CurrState = kGPSObstacleAvoidance;
+
+            RCLCPP_WARN(
+                get_logger(),
+                "[GPS AVOID] Obstacle at %.2f m, goal at %.2f m "
+                "-> starting avoidance",
+                obstacle_distance,
+                goal_distance);
+
+            return;
+        }
+    }
+
+    // =====================================================
+    // RUN CURRENT STATE
+    // =====================================================
     switch (CurrState)
     {
-        case kObstacleAvoidance:    obstacleAvoidance(); break;
-        case kGPSObstacleAvoidance: gpsObstacleAvoidance(); break;
-        case kSearchPattern:        callSearchPattern(); break;
-        case kArucoFollowing:       arucoFollowing(); break;
-        case kCoordinateFollowing:  coordinateFollowing(); break;
-        default: publishVel(geometry_msgs::msg::Twist()); break;
+        // kManualState intentionally disabled.
+        // case kManualState:
+        //     hardStop();
+        //     break;
+
+        case kNavigationModeSelect:
+            navigationModeSelect();
+            break;
+
+        case kCoordinateFollowing:
+            coordinateFollowing();
+            break;
+
+        case kGPSObstacleAvoidance:
+            gpsObstacleAvoidance();
+            break;
+
+        case kSearchPattern:
+            callSearchPattern();
+            break;
+
+        case kArucoFollowing:
+            arucoFollowing();
+            break;
+
+        case kObstacleAvoidance:
+            obstacleAvoidance();
+            break;
+
+        default:
+            hardStop();
+            break;
     }
 }
 
 void SensorCallback::RoverStateClassifier()
 {
-    if (CurrState == kObstacleAvoidance || CurrState == kGPSObstacleAvoidance) return;
-
-    if ((nav_mode == 0 && gps_goal_reached) || (nav_mode == 1 && aruco_goal_reached))
-    {
-        hardStop();
-        disableAutonomous();
-        CurrState = kManualState;
-        return;
-    }
-
-    if (nav_mode == 0)
-    {
-        if (gps_goal_set && !gps_goal_reached) CurrState = kCoordinateFollowing;
-        return;
-    }
-
-    if (nav_mode == 1)
-    {
-        CurrState = aruco_detect ? kArucoFollowing : kSearchPattern;
-        return;
-    }
+    // =====================================================
+    // MANUAL MODE DISABLED
+    // =====================================================
+    // This classifier no longer changes the rover into manual
+    // mode after a goal or based on rover_state.
+    //
+    // Autonomous state transitions are handled by stackRun().
+    // Function retained for compatibility with the existing
+    // class declaration.
+    return;
 }
 
 void SensorCallback::imuCallback(
-    const aruco_msgs::msg::ImuData::SharedPtr msg)
+    const msgs::msg::ImuData::SharedPtr msg)
 {
     std::lock_guard<std::mutex> lock(state_mutex_);
     imu_yaw = msg->orientation.z;
@@ -149,16 +378,22 @@ void SensorCallback::gpsCallback(const sensor_msgs::msg::NavSatFix::SharedPtr fi
     last_gps_time_ = this->get_clock()->now();
 }
 
-void SensorCallback::lidarCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan_msg)
+void SensorCallback::pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg)
 {
-    if (!rover_state) return;
-    last_lidar_scan_ = scan_msg;
+    // MANUAL MODE DISABLED: point clouds are processed continuously.
+
+    // Convert the ZED2i PointCloud2 message (XYZ in the camera optical frame:
+    // +x = right, +y = down, +z = forward) into a PCL cloud for processing.
+    auto pcl_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    pcl::fromROSMsg(*cloud_msg, *pcl_cloud);
+
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    last_point_cloud_ = pcl_cloud;
+    last_pointcloud_time_ = this->get_clock()->now();
 }
 
-void SensorCallback::arucoCallback(const aruco_msgs::msg::ArucoTag::SharedPtr msg)
+void SensorCallback::arucoCallback(const msgs::msg::ArucoTag::SharedPtr msg)
 {
-    if (!rover_state) return;
-
     std::lock_guard<std::mutex> lock(state_mutex_);
 
     if (msg->is_detected && msg->id == target_aruco_id_)
@@ -170,47 +405,20 @@ void SensorCallback::arucoCallback(const aruco_msgs::msg::ArucoTag::SharedPtr ms
     }
 }
 
-void SensorCallback::stateCallback(const std_msgs::msg::Bool::SharedPtr state)
+void SensorCallback::stateCallback(
+    const std_msgs::msg::Bool::SharedPtr state)
 {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    (void)state;
 
-    if (state->data == last_rover_state) return;
-
-    last_rover_state = state->data;
-    rover_state = state->data;
-
-    avoiding_obstacle_ = false;
-    publishVel(geometry_msgs::msg::Twist());
-
-    nav_mode = -1;
-    nav_select_done_ = false;
-
-    gps_goal_set = false;
-    gps_goal_reached = false;
-    aruco_goal_reached = false;
-
-    gps_aligned_ = false;
-    gps_waiting_ = false;
-    gps_last_check_time_ = this->now();
-
-    aruco_detect = false;
-    obstacle_detect = false;
-
-    resetSearchPattern();
-    search_skew = kNoSkew;
-
-    last_aruco_time_ = this->get_clock()->now();
-    last_gps_time_ = this->get_clock()->now();
-
-    if (!rover_state)
-    {
-        CurrState = kManualState;
-        RCLCPP_INFO(this->get_logger(), "[MODE] MANUAL MODE");
-        return;
-    }
-
-    CurrState = kNavigationModeSelect;
-    RCLCPP_INFO(this->get_logger(), "[MODE] AUTONOMOUS MODE");
+    // =====================================================
+    // MANUAL MODE DISABLED
+    // =====================================================
+    // The external autonomous/manual state topic is ignored.
+    // This node remains autonomous and is not switched to manual.
+    //
+    // Kept as a no-op because the callback is still declared in
+    // the existing class interface.
+    return;
 }
 
 void SensorCallback::navigationModeSelect()
@@ -247,7 +455,9 @@ void SensorCallback::navigationModeSelect()
             std::cout << "[GPS] ERROR: Invalid coordinates\n";
             nav_mode = -1;
             nav_select_done_ = true;
-            CurrState = kManualState;
+            // MANUAL MODE DISABLED.
+            // Invalid input leaves the node stopped in navigation selection.
+            CurrState = kNavigationModeSelect;
             return;
         }
 
@@ -300,7 +510,9 @@ void SensorCallback::navigationModeSelect()
     {
         std::cout << "[CLI] Invalid navigation selection\n";
         nav_mode = -1;
-        CurrState = kManualState;
+        // MANUAL MODE DISABLED:
+        // Stay in navigation selection instead of entering manual.
+        CurrState = kNavigationModeSelect;
     }
 
     nav_select_done_ = true;
@@ -310,38 +522,39 @@ void SensorCallback::coordinateFollowing()
 {
     geometry_msgs::msg::Twist stop_cmd;
 
-    // -----------------------------------------------------
-    // No GPS goal
-    // -----------------------------------------------------
+    // No active GPS goal -> remain stopped
     if (!gps_goal_set)
     {
-        publishVel(stop_cmd);
+        hardStop();
         return;
     }
 
     const auto now = get_clock()->now();
 
-    // -----------------------------------------------------
-    // GPS freshness check
-    // -----------------------------------------------------
+    // =====================================================
+    // GPS FRESHNESS CHECK
+    // =====================================================
     if ((now - last_gps_time_).seconds() > 1.5)
     {
         gps_aligned_ = false;
         gps_waiting_ = false;
 
-        publishVel(stop_cmd);
+        hardStop();
 
         RCLCPP_WARN_THROTTLE(
-            get_logger(), *get_clock(), 2000,
+            get_logger(),
+            *get_clock(),
+            2000,
             "[GPS] GPS data stale -> rover stopped");
+
         return;
     }
 
-    // -----------------------------------------------------
-    // Calculate distance
-    // -----------------------------------------------------
     const double dist = haversine(curr_location, goal_location);
 
+    // =====================================================
+    // GOAL REACHED -> STOP COMPLETELY
+    // =====================================================
     if (dist <= kDistanceThreshold)
     {
         if (!gps_goal_reached)
@@ -352,42 +565,57 @@ void SensorCallback::coordinateFollowing()
                 dist);
         }
 
+        // Mark navigation as finished
         gps_goal_reached = true;
+        gps_goal_set = false;
+
+        // Reset GPS navigation state
         gps_aligned_ = false;
         gps_waiting_ = false;
 
+        // Immediately publish zero velocity
         hardStop();
+
+        // MANUAL MODE DISABLED:
+        // Do not switch state or disable the external controller.
+        // gps_goal_set=false makes coordinateFollowing() remain stopped.
         return;
     }
 
     gps_goal_reached = false;
 
-    // -----------------------------------------------------
-    // Calculate target bearing and SIGNED heading error
-    // -----------------------------------------------------
+    // =====================================================
+    // CALCULATE TARGET BEARING AND HEADING ERROR
+    // =====================================================
     const double target_bearing =
         gpsBearing(curr_location, goal_location);
 
     const double error =
         headingError(target_bearing, imu_yaw);
 
-    // Absolute value is used only to check alignment tolerance
-    const double shortest_error = std::abs(error);
+    const double shortest_error =
+        std::min(error, 360.0 - error);
 
     RCLCPP_INFO_THROTTLE(
-        get_logger(), *get_clock(), 1000,
-        "[GPS] Distance: %.2f m | Target: %.1f deg | Current: %.1f deg | Error: %.1f deg",
-        dist, target_bearing, imu_yaw, error);
+        get_logger(),
+        *get_clock(),
+        1000,
+        "[GPS] Distance: %.2f m | Target: %.1f deg | "
+        "Current: %.1f deg | Error: %.1f deg",
+        dist,
+        target_bearing,
+        imu_yaw,
+        shortest_error);
 
     constexpr double HEADING_TOLERANCE = 10.0;
     constexpr double WAIT_TIME = 2.0;
     constexpr double CHECK_TIME = 2.0;
-    constexpr double TURN_SPEED = 2.0;
+    constexpr double TURN_SPEED = 1.0;
 
     geometry_msgs::msg::Twist cmd;
 
     // =====================================================
-    // STEP 1: ALIGN WITH THE GPS TARGET
+    // STEP 1: ALIGN WITH GPS TARGET
     // =====================================================
     if (!gps_aligned_)
     {
@@ -398,37 +626,32 @@ void SensorCallback::coordinateFollowing()
             gps_wait_end_ =
                 now + rclcpp::Duration::from_seconds(WAIT_TIME);
 
-            publishVel(stop_cmd);
+            hardStop();
             return;
         }
 
+        // No forward movement while turning
         cmd.linear.x = 0.0;
 
-        // Your rover convention:
-        // negative angular.z = RIGHT
-        // positive angular.z = LEFT
-        //
-        // Positive signed error means target is clockwise/right.
-        if (error > 0.0)
-            cmd.angular.z = -TURN_SPEED;  // RIGHT
+        if (error <= 180.0)
+            cmd.angular.z = -TURN_SPEED;
         else
-            cmd.angular.z = TURN_SPEED;   // LEFT
+            cmd.angular.z = TURN_SPEED;
 
         publishVel(cmd);
         return;
     }
 
     // =====================================================
-    // STEP 2: STOP AND WAIT 2 SECONDS
+    // STEP 2: STOP AND VERIFY ALIGNMENT
     // =====================================================
     if (gps_waiting_)
     {
-        publishVel(stop_cmd);
+        hardStop();
 
         if (now < gps_wait_end_)
             return;
 
-        // Recheck heading after waiting
         if (shortest_error > HEADING_TOLERANCE)
         {
             gps_aligned_ = false;
@@ -444,7 +667,7 @@ void SensorCallback::coordinateFollowing()
     }
 
     // =====================================================
-    // STEP 3: DRIVE STRAIGHT AND CHECK EVERY 2 SECONDS
+    // STEP 3: DRIVE STRAIGHT
     // =====================================================
     if ((now - gps_last_check_time_).seconds() >= CHECK_TIME)
     {
@@ -455,192 +678,688 @@ void SensorCallback::coordinateFollowing()
             gps_aligned_ = false;
             gps_waiting_ = false;
 
-            publishVel(stop_cmd);
+            hardStop();
 
             RCLCPP_WARN(
                 get_logger(),
                 "[GPS] Heading lost -> realigning");
+
             return;
         }
     }
 
     // =====================================================
-    // Heading is good: drive straight
-    // =====================================================
-    cmd.linear.x = 1.8;
-    cmd.angular.z = 0.0;
+// DRIVE STRAIGHT TOWARD THE GOAL
+//
+// If the GPS goal is closer than the detected obstacle,
+// the goal is effectively before the obstacle. Ignore
+// obstacle avoidance and proceed directly at 0.75 m/s.
+// =====================================================
+const bool goal_before_obstacle =
+    obstacle_detect &&
+    dist < static_cast<double>(obs_x);
 
-    publishVel(cmd);
+if (goal_before_obstacle)
+{
+    cmd.linear.x = 0.75;
+}
+else
+{
+    cmd.linear.x = 0.8;
+}
+
+cmd.angular.z = 0.0;
+
+publishVel(cmd);
 }
 
 void SensorCallback::obstacleAvoidance()
 {
+    // =====================================================
+    // ARUCO PRIORITY WHILE IN OBSTACLE AVOIDANCE
+    //
+    // If obstacle avoidance was entered while following an
+    // ArUco, continuously compare their distances.
+    //
+    // ArUco <= obstacle -> FOLLOW ARUCO
+    // Obstacle < ArUco -> KEEP AVOIDING
+    // =====================================================
+    if (nav_mode == 1 &&
+        prev_state_ == kArucoFollowing &&
+        aruco_detect &&
+        aruco_x > 0.0)
+    {
+        const bool aruco_is_closer =
+            !obstacle_detect ||
+            obs_x <= 0.0 ||
+            aruco_x <= static_cast<double>(obs_x);
+
+        if (aruco_is_closer)
+        {
+            avoiding_obstacle_ = false;
+            CurrState = kArucoFollowing;
+
+            RCLCPP_INFO_THROTTLE(
+                get_logger(),
+                *get_clock(),
+                500,
+                "[ARUCO PRIORITY] ArUco %.2f m | Obstacle %.2f m "
+                "-> ArUco is closer, resuming following",
+                aruco_x,
+                obs_x);
+
+            // Run ArUco following immediately instead of
+            // waiting for the next stackRun() cycle.
+            arucoFollowing();
+            return;
+        }
+    }
+
+    // =====================================================
+    // OBSTACLE STILL PRESENT -> TURN AWAY
+    //
+    // This only continues when the obstacle is genuinely
+    // closer than the ArUco, or there is no valid ArUco.
+    // =====================================================
     if (obstacle_detect)
     {
         avoiding_obstacle_ = true;
 
         geometry_msgs::msg::Twist cmd;
         cmd.linear.x = 0.0;
-        cmd.angular.z = (obs_side_ && std::string(obs_side_) == "left") ? -1.0 : 1.0;
+
+        // Obstacle LEFT -> turn RIGHT
+        // Obstacle RIGHT -> turn LEFT
+        // Center/unknown -> default LEFT
+        if (obs_side_ && std::string(obs_side_) == "left")
+        {
+            cmd.angular.z = -1.0;
+        }
+        else if (obs_side_ && std::string(obs_side_) == "right")
+        {
+            cmd.angular.z = 1.0;
+        }
+        else
+        {
+            cmd.angular.z = 1.0;
+        }
+
+        publishVel(cmd);
+
+        RCLCPP_WARN_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            500,
+            "[ARUCO OA] AVOIDING | obstacle=%.2f m forward | "
+            "lateral=%.2f m | side=%s | turning=%.2f rad/s",
+            obs_x,
+            obs_y,
+            obs_side_ ? obs_side_ : "unknown",
+            cmd.angular.z);
+
+        return;
+    }
+
+    // =====================================================
+    // OBSTACLE CLEARED
+    // =====================================================
+    hardStop();
+    avoiding_obstacle_ = false;
+
+    RCLCPP_INFO(
+        get_logger(),
+        "[ARUCO OA] Obstacle cleared");
+
+    // =====================================================
+    // OA INTERRUPTED ARUCO FOLLOWING
+    // =====================================================
+    if (nav_mode == 1 && prev_state_ == kArucoFollowing)
+    {
+        // Marker survived / is still visible -> follow it again
+        if (aruco_detect)
+        {
+            CurrState = kArucoFollowing;
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[ARUCO OA] ArUco still visible -> "
+                "resuming ArUco following");
+
+            return;
+        }
+
+        // Marker disappeared during avoidance -> fresh forward search
+        resetSearchPattern();
+        FollowPattern = kMoveForward;
+        CurrState = kSearchPattern;
+
+        RCLCPP_INFO(
+            get_logger(),
+            "[ARUCO OA] ArUco lost during avoidance -> "
+            "returning to search pattern at MOVE FORWARD");
+
+        return;
+    }
+
+    // =====================================================
+    // OA INTERRUPTED SEARCH PATTERN
+    // =====================================================
+    if (nav_mode == 1 && prev_state_ == kSearchPattern)
+    {
+        // Resume the exact search phase that was interrupted.
+        FollowPattern = prev_search_pattern_;
+        CurrState = kSearchPattern;
+
+        RCLCPP_INFO(
+            get_logger(),
+            "[ARUCO OA] Resuming interrupted search phase");
+
+        return;
+    }
+
+    // =====================================================
+    // SAFETY FALLBACK
+    // =====================================================
+    hardStop();
+
+    RCLCPP_WARN(
+        get_logger(),
+        "[ARUCO OA] Unexpected previous state -> stopping safely");
+}
+
+
+void SensorCallback::gpsObstacleAvoidance()
+{
+    // =====================================================
+    // SAFETY: GOAL REACHED WHILE AVOIDING
+    // =====================================================
+    if (nav_mode == 0 &&
+        gps_goal_set &&
+        !gps_goal_reached)
+    {
+        const double dist =
+            haversine(curr_location, goal_location);
+
+        if (dist <= kDistanceThreshold)
+        {
+            gps_goal_reached = true;
+            gps_goal_set = false;
+
+            gps_avoiding_ = false;
+            gps_avoid_direction_ = 0;
+            gps_avoid_moving_forward_ = false;
+            gps_aligned_ = false;
+            gps_waiting_ = false;
+
+            hardStop();
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[GPS] GOAL REACHED DURING AVOIDANCE -> STOPPED | "
+                "Distance: %.2f m",
+                dist);
+
+            // MANUAL MODE DISABLED.
+            // Stay in autonomous code; goal flags keep the rover stopped.
+            return;
+        }
+    }
+
+    // =====================================================
+    // MANUAL MODE DISABLED
+    // =====================================================
+    // No manual-state safety gate is used here.
+    //
+    geometry_msgs::msg::Twist cmd;
+    const auto now = get_clock()->now();
+
+    constexpr double TURN_SPEED = 1.0;
+    constexpr double FORWARD_SPEED = 1.1;
+    constexpr double FORWARD_TIME = 2.0;
+
+    // =====================================================
+    // STEP 1: TURN AWAY FROM THE OBSTACLE
+    // =====================================================
+    if (!gps_avoid_moving_forward_)
+    {
+        if (obstacle_detect)
+        {
+            if (gps_avoid_direction_ == 0)
+            {
+                if (obs_side_ &&
+                    std::string(obs_side_) == "left")
+                {
+                    gps_avoid_direction_ = -1;
+
+                    RCLCPP_WARN(
+                        get_logger(),
+                        "[GPS AVOID] Obstacle LEFT -> turning RIGHT");
+                }
+                else if (obs_side_ &&
+                         std::string(obs_side_) == "right")
+                {
+                    gps_avoid_direction_ = 1;
+
+                    RCLCPP_WARN(
+                        get_logger(),
+                        "[GPS AVOID] Obstacle RIGHT -> turning LEFT");
+                }
+                else
+                {
+                    gps_avoid_direction_ = 1;
+
+                    RCLCPP_WARN(
+                        get_logger(),
+                        "[GPS AVOID] Obstacle CENTER/UNKNOWN -> turning LEFT");
+                }
+            }
+
+            cmd.linear.x = 0.0;
+            cmd.angular.z =
+                gps_avoid_direction_ * TURN_SPEED;
+
+            publishVel(cmd);
+            return;
+        }
+
+        // Front clear -> start forward movement
+        gps_avoid_moving_forward_ = true;
+
+        gps_avoid_forward_end_ =
+            now + rclcpp::Duration::from_seconds(FORWARD_TIME);
+
+        cmd.linear.x = FORWARD_SPEED;
+        cmd.angular.z = 0.0;
+
+        publishVel(cmd);
+
+        RCLCPP_INFO(
+            get_logger(),
+            "[GPS AVOID] Front clear -> moving forward for %.1f seconds",
+            FORWARD_TIME);
+
+        return;
+    }
+
+    // =====================================================
+    // STEP 2: MOVE FORWARD
+    // =====================================================
+    if (now < gps_avoid_forward_end_)
+    {
+        // Check goal AGAIN because the rover may physically
+        // reach it during this forward movement.
+        if (gps_goal_set)
+        {
+            const double dist =
+                haversine(curr_location, goal_location);
+
+            if (dist <= kDistanceThreshold)
+            {
+                gps_goal_reached = true;
+                gps_goal_set = false;
+
+                gps_avoiding_ = false;
+                gps_avoid_moving_forward_ = false;
+
+                hardStop();
+
+                RCLCPP_INFO(
+                    get_logger(),
+                    "[GPS] GOAL REACHED -> STOPPED | Distance: %.2f m",
+                    dist);
+
+                // MANUAL MODE DISABLED:
+                // Do not switch state or disable the external controller.
+                // Goal flags keep the rover stopped.
+                return;
+            }
+        }
+
+        cmd.linear.x = FORWARD_SPEED;
+        cmd.angular.z = 0.0;
 
         publishVel(cmd);
         return;
     }
 
-    avoiding_obstacle_ = false;
+    // =====================================================
+    // STEP 3: RETURN TO GPS ALIGNMENT
+    // =====================================================
+    hardStop();
 
-    CurrState = kSearchPattern;
-    resetSearchPattern();
+    gps_avoiding_ = false;
+    gps_avoid_direction_ = 0;
+    gps_avoid_moving_forward_ = false;
 
-    RCLCPP_INFO(get_logger(), "[AVOID] obstacle cleared -> SEARCH PATTERN");
-}
+    gps_aligned_ = false;
+    gps_waiting_ = false;
 
-void SensorCallback::gpsObstacleAvoidance()
-{
-    // Placeholder for future GPS obstacle avoidance.
-    // No obstacle avoidance logic implemented yet.
+    CurrState = kCoordinateFollowing;
+
+    RCLCPP_INFO(
+        get_logger(),
+        "[GPS AVOID] Forward movement complete -> returning to GPS alignment");
 }
 
 void SensorCallback::arucoFollowing()
 {
+    // =====================================================
+    // MARKER LOST
+    // =====================================================
     if (!aruco_detect)
     {
-        publishVel(geometry_msgs::msg::Twist());
+        hardStop();
         return;
     }
 
     geometry_msgs::msg::Twist cmd;
 
-    constexpr double k_ang = 0.7;
-    constexpr double y_deadband = 0.06;
-    constexpr double max_ang = 0.7;
-    constexpr double constant_lin = 0.8;
+    constexpr double ANGULAR_GAIN = 0.8;
+    constexpr double Y_DEADBAND = 0.05;
+    constexpr double MAX_ANGULAR = 1.5;
 
-    double ang_err = aruco_y;
-    if (std::abs(ang_err) < y_deadband) ang_err = 0.0;
+    constexpr double FOLLOW_SPEED = 0.75;
+    constexpr double SPEED_SCALING_DISTANCE = 3.5;
+    constexpr double MIN_FOLLOW_SPEED = 0.50;
 
-    cmd.angular.z = std::clamp(-k_ang * ang_err, -max_ang, max_ang);
+    // =====================================================
+    // LATERAL ALIGNMENT
+    // =====================================================
+    double lateral_error = aruco_y;
 
-    if (aruco_x == -1.0)
-        cmd.linear.x = 0.8;
-    else if (aruco_x <= kDistanceThreshold)
-        cmd.linear.x = 0.0;
+    if (std::abs(lateral_error) < Y_DEADBAND)
+        lateral_error = 0.0;
+
+    cmd.angular.z = std::clamp(
+        -ANGULAR_GAIN * lateral_error,
+        -MAX_ANGULAR,
+        MAX_ANGULAR);
+
+    // =====================================================
+    // DISTANCE-BASED LINEAR VELOCITY
+    // =====================================================
+    // At >= 3.5 m: full speed.
+    // Below 3.5 m: quadratic scaling slows the rover more
+    // aggressively as it approaches the marker.
+    if (aruco_x >= SPEED_SCALING_DISTANCE)
+    {
+        cmd.linear.x = std::min(FOLLOW_SPEED, kMaxLinearVel);
+    }
     else
-        cmd.linear.x = std::min(constant_lin, kMaxLinearVel);
+    {
+        double distance_scale = std::clamp(
+            aruco_x / SPEED_SCALING_DISTANCE,
+            0.0,
+            1.0);
+
+        // Quadratic scaling: more aggressive slowdown near goal
+        distance_scale = distance_scale * distance_scale;
+
+        const double scaled_speed =
+            MIN_FOLLOW_SPEED +
+            (FOLLOW_SPEED - MIN_FOLLOW_SPEED) * distance_scale;
+
+        cmd.linear.x = std::min(scaled_speed, kMaxLinearVel);
+    }
 
     RCLCPP_INFO_THROTTLE(
-        get_logger(), *get_clock(), 1000,
-        "[ARUCO] Following | Distance: %.2f m | Error: %.2f",
-        aruco_x, aruco_y);
+        get_logger(),
+        *get_clock(),
+        500,
+        "[ARUCO] Following | Distance: %.2f m | "
+        "Lateral error: %.2f | Lin: %.2f | Ang: %.2f",
+        aruco_x,
+        aruco_y,
+        cmd.linear.x,
+        cmd.angular.z);
 
     publishVel(cmd);
 }
 
+
 void SensorCallback::callSearchPattern()
 {
+    // =====================================================
+    // SEARCH PATTERN SPEEDS
+    // Local constants so this function does not depend on
+    // undefined global/class constants.
+    // =====================================================
+    constexpr double LINEAR_SPEED = 0.75;
+    constexpr double ANGULAR_SPEED = 1.0;
+
     geometry_msgs::msg::Twist cmd;
-    auto clock = this->get_clock();
-    auto now = clock->now();
+    const auto now = get_clock()->now();
 
-    const double ang_vel = 1.0;
-    const double lin_vel = 0.65;
-
-    if (aruco_detect) return;
-
+    // =====================================================
+    // OPTIONAL INITIAL SPOT TURN
+    // =====================================================
     if (spot_turn_back_ && !spot_done_)
     {
-        cmd.angular.z = ang_vel;
+        cmd.linear.x = 0.0;
+        cmd.angular.z = ANGULAR_SPEED;
         publishVel(cmd);
 
-        RCLCPP_INFO_THROTTLE(get_logger(), *clock, 1000, "[SEARCH][SPOT] Turning in place | ang=%.2f", cmd.angular.z);
+        RCLCPP_INFO_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            1000,
+            "[SEARCH][SPOT] Turning in place | ang=%.2f",
+            cmd.angular.z);
 
         if (now >= search_end_time_)
         {
             spot_done_ = true;
             search_ref_set_ = false;
-            RCLCPP_INFO(get_logger(), "[SEARCH][SPOT] turn done -> start pattern");
+
+            // Stop before starting the forward pattern
+            hardStop();
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[SEARCH][SPOT] Turn done -> starting search pattern");
         }
+
         return;
     }
 
+    // =====================================================
+    // INITIALIZE SEARCH PATTERN
+    // =====================================================
     if (!search_ref_set_)
     {
         FollowPattern = kMoveForward;
-        search_end_time_ = now + rclcpp::Duration::from_seconds(search_forward_time_);
+
+        search_end_time_ =
+            now + rclcpp::Duration::from_seconds(search_forward_time_);
+
         search_ref_set_ = true;
 
-        RCLCPP_INFO(get_logger(), "[SEARCH] Starting the search pattern, moving forward");
+        RCLCPP_INFO(
+            get_logger(),
+            "[SEARCH] Starting search pattern -> MOVE FORWARD | "
+            "duration=%.2f sec | cycle=%d | skew=%d",
+            search_forward_time_,
+            search_cycle_,
+            search_skew);
 
-        geometry_msgs::msg::Twist c;
-        c.linear.x = lin_vel;
-        publishVel(c);
+        cmd.linear.x = LINEAR_SPEED;
+        cmd.angular.z = 0.0;
+        publishVel(cmd);
+
         return;
     }
 
+    // =====================================================
+    // MOVE FORWARD
+    // =====================================================
+    if (FollowPattern == kMoveForward)
+    {
+        cmd.linear.x = LINEAR_SPEED;
+        cmd.angular.z = 0.0;
+        publishVel(cmd);
+
+        RCLCPP_INFO_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            1000,
+            "[SEARCH][FORWARD] lin=%.2f | cycle=%d | skew=%d",
+            cmd.linear.x,
+            search_cycle_,
+            search_skew);
+
+        if (now >= search_end_time_)
+        {
+            hardStop();
+
+            search_cycle_++;
+
+            FollowPattern = kTurnA;
+
+            search_end_time_ =
+                now + rclcpp::Duration::from_seconds(3.5);
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[SEARCH][FORWARD] Done -> TURN A | cycle=%d",
+                search_cycle_);
+        }
+
+        return;
+    }
+
+    // =====================================================
+    // TURN A
+    // =====================================================
     if (FollowPattern == kTurnA)
     {
         const bool right_skew = (search_skew == kRightSkew);
-        cmd.angular.z = right_skew ? -ang_vel : +ang_vel;
+
+        cmd.linear.x = 0.0;
+        cmd.angular.z =
+            right_skew ? -ANGULAR_SPEED : ANGULAR_SPEED;
+
         publishVel(cmd);
 
-        RCLCPP_INFO_THROTTLE(get_logger(), *clock, 1000, "[SEARCH][TURN A] ang=%.2f skew=%d cycle=%d", cmd.angular.z, search_skew, search_cycle_);
+        RCLCPP_INFO_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            1000,
+            "[SEARCH][TURN A] ang=%.2f | cycle=%d | skew=%d",
+            cmd.angular.z,
+            search_cycle_,
+            search_skew);
 
         if (now >= search_end_time_)
         {
+            hardStop();
+
             FollowPattern = kTurnB;
-            search_end_time_ = now + rclcpp::Duration::from_seconds(7.0);
+
+            search_end_time_ =
+                now + rclcpp::Duration::from_seconds(7.0);
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[SEARCH][TURN A] Done -> TURN B");
         }
+
         return;
     }
 
+    // =====================================================
+    // TURN B
+    // =====================================================
     if (FollowPattern == kTurnB)
     {
         const bool right_skew = (search_skew == kRightSkew);
-        cmd.angular.z = right_skew ? +ang_vel : -ang_vel;
+
+        cmd.linear.x = 0.0;
+        cmd.angular.z =
+            right_skew ? ANGULAR_SPEED : -ANGULAR_SPEED;
+
         publishVel(cmd);
 
-        RCLCPP_INFO_THROTTLE(get_logger(), *clock, 1000, "[SEARCH][TURN B] ang=%.2f skew=%d cycle=%d", cmd.angular.z, search_skew, search_cycle_);
+        RCLCPP_INFO_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            1000,
+            "[SEARCH][TURN B] ang=%.2f | cycle=%d | skew=%d",
+            cmd.angular.z,
+            search_cycle_,
+            search_skew);
 
         if (now >= search_end_time_)
         {
+            hardStop();
+
             FollowPattern = kTurnC;
-            double extra = (search_skew != kNoSkew) ? static_cast<double>(search_cycle_) : 0.0;
-            search_end_time_ = now + rclcpp::Duration::from_seconds(3.5 + extra);
+
+            const double extra =
+                (search_skew != kNoSkew)
+                    ? static_cast<double>(search_cycle_)
+                    : 0.0;
+
+            search_end_time_ =
+                now + rclcpp::Duration::from_seconds(3.5 + extra);
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[SEARCH][TURN B] Done -> TURN C | extra=%.2f sec",
+                extra);
         }
+
         return;
     }
 
+    // =====================================================
+    // TURN C
+    // =====================================================
     if (FollowPattern == kTurnC)
     {
         const bool right_skew = (search_skew == kRightSkew);
-        cmd.angular.z = right_skew ? -ang_vel : +ang_vel;
+
+        cmd.linear.x = 0.0;
+        cmd.angular.z =
+            right_skew ? -ANGULAR_SPEED : ANGULAR_SPEED;
+
         publishVel(cmd);
 
-        RCLCPP_INFO_THROTTLE(get_logger(), *clock, 1000, "[SEARCH][TURN C] ang=%.2f skew=%d cycle=%d", cmd.angular.z, search_skew, search_cycle_);
+        RCLCPP_INFO_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            1000,
+            "[SEARCH][TURN C] ang=%.2f | cycle=%d | skew=%d",
+            cmd.angular.z,
+            search_cycle_,
+            search_skew);
 
         if (now >= search_end_time_)
         {
+            hardStop();
+
             FollowPattern = kMoveForward;
-            search_end_time_ = now + rclcpp::Duration::from_seconds(search_forward_time_);
+
+            search_end_time_ =
+                now + rclcpp::Duration::from_seconds(
+                    search_forward_time_);
+
+            RCLCPP_INFO(
+                get_logger(),
+                "[SEARCH][TURN C] Done -> MOVE FORWARD | cycle=%d",
+                search_cycle_);
         }
+
         return;
     }
 
-    if (FollowPattern == kMoveForward)
-    {
-        cmd.linear.x = lin_vel;
-        publishVel(cmd);
+    // =====================================================
+    // SAFETY FALLBACK
+    // =====================================================
+    RCLCPP_WARN(
+        get_logger(),
+        "[SEARCH] Unknown search phase -> STOPPING");
 
-        RCLCPP_INFO_THROTTLE(get_logger(), *clock, 1000, "[SEARCH][FORWARD] lin=%.2f cycle=%d skew=%d", cmd.linear.x, search_cycle_, search_skew);
-
-        if (now >= search_end_time_)
-        {
-            search_cycle_++;
-            FollowPattern = kTurnA;
-            search_end_time_ = now + rclcpp::Duration::from_seconds(3.5);
-        }
-        return;
-    }
+    hardStop();
 }
 
 void SensorCallback::publishVel(const geometry_msgs::msg::Twist &msg)
@@ -668,117 +1387,267 @@ void SensorCallback::publishVel(const geometry_msgs::msg::Twist &msg)
 void SensorCallback::hardStop()
 {
     geometry_msgs::msg::Twist stop;
-
-    for (int i = 0; i < 5; ++i)
-    {
-        vel_pub->publish(stop);
-        rclcpp::sleep_for(std::chrono::milliseconds(20));
-    }
+    vel_pub->publish(stop);
 }
 
-void SensorCallback::disableAutonomous()
-{
-    if (!toggle_client_->wait_for_service(std::chrono::seconds(1)))
-    {
-        RCLCPP_ERROR(this->get_logger(), "[MODE] toggle_autonomous service not available");
-        return;
-    }
-
-    auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
-    toggle_client_->async_send_request(
-        req,
-        [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future)
-        {
-            auto res = future.get();
-            if (res->success)
-                RCLCPP_INFO(this->get_logger(), "[MODE] Autonomous DISABLED via service");
-            else
-                RCLCPP_ERROR(this->get_logger(), "[MODE] Failed to disable autonomy: %s", res->message.c_str());
-        });
-}
+// =====================================================
+// MANUAL MODE DISABLED
+// =====================================================
+// disableAutonomous() is intentionally commented out.
+// The node no longer toggles the external autonomous/manual
+// controller when a GPS or ArUco goal is reached.
+//
+// Original implementation retained below for reference.
+//
+//
+// void SensorCallback::disableAutonomous()
+// {
+//     // =====================================================
+//     // LOCAL SAFETY LOCKOUT FIRST
+//     //
+//     // The service request below is asynchronous. Therefore
+//     // we MUST stop autonomous execution locally BEFORE
+//     // waiting for the external controller to respond.
+//     // =====================================================
+//     rover_state = false;
+//     last_rover_state = false;
+//
+//     CurrState = kManualState;
+//
+//     // Cancel active autonomous movement
+//     gps_goal_set = false;
+//
+//     gps_aligned_ = false;
+//     gps_waiting_ = false;
+//     gps_avoiding_ = false;
+//     gps_avoid_direction_ = 0;
+//     gps_avoid_moving_forward_ = false;
+//
+//     avoiding_obstacle_ = false;
+//
+//     // =====================================================
+//     // IMMEDIATELY STOP THE ROVER
+//     // =====================================================
+//     hardStop();
+//
+//     // Send several zero commands while we are still the
+//     // autonomous cmd_vel publisher.
+//     geometry_msgs::msg::Twist stop;
+//
+//     for (int i = 0; i < 5; ++i)
+//     {
+//         vel_pub->publish(stop);
+//     }
+//
+//     RCLCPP_INFO(
+//         get_logger(),
+//         "[MODE] Local autonomous safety lockout -> STOPPED");
+//
+//     // =====================================================
+//     // THEN DISABLE THE EXTERNAL AUTONOMOUS CONTROLLER
+//     // =====================================================
+//     if (!toggle_client_->wait_for_service(
+//             std::chrono::seconds(1)))
+//     {
+//         RCLCPP_ERROR(
+//             get_logger(),
+//             "[MODE] toggle_autonomous service not available");
+//
+//         // We remain locally locked in manual regardless.
+//         hardStop();
+//         return;
+//     }
+//
+//     auto req =
+//         std::make_shared<std_srvs::srv::Trigger::Request>();
+//
+//     toggle_client_->async_send_request(
+//         req,
+//         [this](
+//             rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future)
+//         {
+//             // Safety: publish zero before processing response.
+//             hardStop();
+//
+//             auto res = future.get();
+//
+//             if (res->success)
+//             {
+//                 // Final explicit stop.
+//                 hardStop();
+//
+//                 RCLCPP_INFO(
+//                     this->get_logger(),
+//                     "[MODE] Autonomous DISABLED via service");
+//             }
+//             else
+//             {
+//                 // NEVER resume autonomous movement if the
+//                 // external service fails.
+//                 rover_state = false;
+//                 CurrState = kManualState;
+//
+//                 hardStop();
+//
+//                 RCLCPP_ERROR(
+//                     this->get_logger(),
+//                     "[MODE] Failed to disable autonomy: %s",
+//                     res->message.c_str());
+//             }
+//         });
+// }
+//
 
 void SensorCallback::obstacleClassifier()
 {
-    if (!last_lidar_scan_)
+    std::lock_guard<std::mutex> lock(state_mutex_);
+
+    // No point cloud available
+    if (!last_point_cloud_ || last_point_cloud_->points.empty())
     {
         obstacle_detect = false;
         obs_x = 0.0;
         obs_y = 0.0;
+        obs_side_ = "none";
         return;
     }
 
     bool found = false;
-    float best_x = std::numeric_limits<float>::max();
-    float x = 0.0f;
-    float y = 0.0f;
+    float best_forward = std::numeric_limits<float>::max();
+    float nearest_forward = 0.0f;
+    float nearest_lateral = 0.0f;
 
-    constexpr float min_x = 0.4f;
-    constexpr float max_x = 2.0f;
-    constexpr float half_w = 1.20f;
-    constexpr float aruco_mask_radius = 0.40f;
+    // Detection corridor: 1.3 m to either side of the rover center
+    constexpr float HALF_WIDTH = 1.10f;
 
-    const auto &scan = *last_lidar_scan_;
-    float angle = scan.angle_min;
+    // Only consider obstacles between 0.3 m and 3.0 m ahead
+    constexpr float MIN_FORWARD = 0.30f;
+    constexpr float MAX_FORWARD = 2.70f;
 
-    for (size_t i = 0; i < scan.ranges.size(); ++i, angle += scan.angle_increment)
+    // Ignore the area around the detected ArUco marker
+    constexpr float ARUCO_MASK_RADIUS = 0.40f;
+
+    // Process every second point for lower CPU usage
+    constexpr size_t STRIDE = 1;
+
+    const auto &cloud = *last_point_cloud_;
+
+    for (size_t i = 0; i < cloud.points.size(); i += STRIDE)
     {
-        const float r = scan.ranges[i];
+        const auto &pt = cloud.points[i];
 
-        if (r < scan.range_min || r > scan.range_max || !std::isfinite(r)) continue;
-
-        const float px = r * std::cos(angle);
-        const float py = r * std::sin(angle);
-
-        if (aruco_detect)
+        // Ignore invalid points
+        if (!std::isfinite(pt.x) ||
+            !std::isfinite(pt.y) ||
+            !std::isfinite(pt.z))
         {
-            const float dx = px - static_cast<float>(aruco_x);
-            const float dy = py - static_cast<float>(aruco_y);
-
-            if (std::sqrt(dx * dx + dy * dy) < aruco_mask_radius) continue;
+            continue;
         }
 
-        if (px < min_x || px > max_x || std::abs(py) > half_w) continue;
+        // ROS-style frame:
+        // +X = forward
+        // +Y = left
+        // +Z = up
+        const float forward = pt.x;
+        const float lateral = pt.y;
 
-        if (px < best_x)
+        // Only consider points within the detection range and corridor
+        if (forward < MIN_FORWARD ||
+            forward > MAX_FORWARD ||
+            std::abs(lateral) > HALF_WIDTH)
         {
-            best_x = px;
-            x = px;
-            y = py;
+            continue;
+        }
+
+        // Ignore the area around the detected ArUco marker
+        if (aruco_detect)
+        {
+            const float dx =
+                forward - static_cast<float>(aruco_x);
+            const float dy =
+                lateral - static_cast<float>(aruco_y);
+
+            if ((dx * dx) + (dy * dy) <
+                (ARUCO_MASK_RADIUS * ARUCO_MASK_RADIUS))
+            {
+                continue;
+            }
+        }
+
+        // Keep the closest obstacle in the forward direction
+        if (forward < best_forward)
+        {
+            best_forward = forward;
+            nearest_forward = forward;
+            nearest_lateral = lateral;
             found = true;
         }
     }
 
     obstacle_detect = found;
 
-    if (found)
-    {
-        obs_x = x;
-        obs_y = y;
-        obs_side_ = (obs_y > 0.15) ? "left" : (obs_y < -0.15) ? "right" : "center";
-    }
-    else
+    // No obstacle found
+    if (!found)
     {
         obs_x = 0.0;
         obs_y = 0.0;
-        obs_side_ = "center";
+        obs_side_ = "none";
+        return;
     }
+
+    // Store obstacle position
+    obs_x = nearest_forward;
+    obs_y = nearest_lateral;
+
+    // +Y is left, -Y is right
+    if (obs_y >= 0.0)
+    {
+        obs_side_ = "left";
+    }
+    else
+    {
+        obs_side_ = "right";
+    }
+
+    // Debug log: printed at most once every 500 ms
+    RCLCPP_INFO_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        500,
+        "[OBSTACLE] Detected | Forward: %.2f m | Lateral: %.2f m | Side: %s",
+        obs_x,
+        obs_y,
+        obs_side_ ? obs_side_ : "unknown");
 }
+  
 
 void SensorCallback::setGoalStatus()
 {
-    static int valid_count = 0;
+    // Only check ArUco goal while actively following a valid target
+    if (nav_mode != 1 ||
+        CurrState != kArucoFollowing ||
+        aruco_goal_reached ||
+        !aruco_detect)
+    {
+        return;
+    }
 
-    if (nav_mode != 1 || CurrState != kArucoFollowing || aruco_goal_reached || !aruco_detect) return;
+    // Invalid/behind-camera distance -> ignore
+    if (aruco_x < 0.0)
+        return;
 
-    if (aruco_x >= 0.0 && aruco_x <= kDistanceThreshold)
-        ++valid_count;
-    else
-        valid_count = 0;
-
-    if (valid_count >= 5)
+    // Target reached
+    if (aruco_x <= kDistanceThreshold)
     {
         aruco_goal_reached = true;
-        RCLCPP_INFO(this->get_logger(), "[ARUCO] Goal reached");
+
+        // Immediately kill motion
+        hardStop();
+
+        RCLCPP_INFO(
+            get_logger(),
+            "[ARUCO] GOAL REACHED -> STOPPED | Distance: %.2f m",
+            aruco_x);
     }
 }
 
@@ -834,10 +1703,11 @@ double SensorCallback::gpsBearing(Coordinates curr, Coordinates dest)
 
 double SensorCallback::headingError(double target, double current)
 {
-    // Signed shortest angular error in degrees: [-180, +180)
-    // Positive = target is clockwise/right of current heading
-    // Negative = target is counter-clockwise/left of current heading
-    return std::fmod(target - current + 540.0, 360.0) - 180.0;
+    double error = std::fmod(target - current + 360.0, 360.0);
+
+    if (error < 0.0) error += 360.0;
+
+    return error;
 }
 
 } // namespace planner

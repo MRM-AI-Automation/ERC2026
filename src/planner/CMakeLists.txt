@@ -11,7 +11,12 @@ find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
-find_package(aruco_msgs REQUIRED)
+find_package(msgs REQUIRED)
+
+# Point Cloud dependencies
+find_package(PCL REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(pcl_ros REQUIRED)
 
 
 # ============================================
@@ -25,6 +30,7 @@ add_executable(planner_node
 target_include_directories(planner_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
 )
 
 ament_target_dependencies(planner_node
@@ -33,7 +39,17 @@ ament_target_dependencies(planner_node
   sensor_msgs
   std_msgs
   std_srvs
-  aruco_msgs
+  msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_link_libraries(planner_node
+  ${PCL_LIBRARIES}
+)
+
+target_compile_definitions(planner_node PUBLIC
+  ${PCL_DEFINITIONS}
 )
 
 
@@ -49,7 +65,7 @@ ament_target_dependencies(relay_node
   geometry_msgs
   std_msgs
   std_srvs
-  aruco_msgs
+  msgs
 )
 
 
@@ -78,7 +94,7 @@ add_executable(angle_turn_controller
 ament_target_dependencies(angle_turn_controller
   rclcpp
   geometry_msgs
-  aruco_msgs
+  msgs
 )
 
 

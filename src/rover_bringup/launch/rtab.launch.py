@@ -34,7 +34,7 @@ def generate_launch_description():
 
                 'use_sim_time': False,                       # Use system time
 
-                'Rtabmap/DetectionRate': '2.0',              # SLAM update rate
+                'Rtabmap/DetectionRate': '10.0',              # SLAM update rate
                 'Rtabmap/TimeThr': '0',                      # No time limit
                 'Rtabmap/PublishOccupancyGrid': 'true',      # Publish grid
 
@@ -44,13 +44,13 @@ def generate_launch_description():
                 'Grid/MapFrameProjection': 'true',           # Project to map frame
 
                 'Grid/NormalK': '30',                         # Normal estimation neighbors
-                'Grid/MaxGroundAngle': '60',                 # Max ground slope
+                'Grid/MaxGroundAngle': '30',                 # Max ground slope
                 'Grid/GroundIsObstacle': 'false',             # Ground drop = obstacle
                 'Grid/MinGroundHeight': '-0.25',             # Min ground height
-                'Grid/MaxObstacleHeight': '2.0',             # Max obstacle height
+                'Grid/MaxObstacleHeight': '5.0',             # Max obstacle height
 
                 'Grid/RangeMin': '0.0',                      # Min depth range
-                'Grid/RangeMax': '6.0',                      # Max depth range
+                'Grid/RangeMax': '4.0',                      # Max depth range
 
                 'Grid/UnknownSpaceFilled': 'true',           # Unknown = occupied
 
@@ -73,3 +73,7 @@ def generate_launch_description():
             ]
         )
     ])
+
+
+
+

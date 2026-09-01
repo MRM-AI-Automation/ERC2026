@@ -28,7 +28,7 @@
   <!-- Messages -->
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
-  <depend>aruco_msgs</depend>
+  <depend>msgs</depend>
 
   <!-- Point cloud / TF -->
   <depend>laser_geometry</depend>

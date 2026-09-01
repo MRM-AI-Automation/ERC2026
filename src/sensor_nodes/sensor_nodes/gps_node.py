@@ -15,7 +15,7 @@ class GPSNode(Node):
     def __init__(self):
         super().__init__('gps_node')
 
-        self.port = '/dev/ttyACM0'
+        self.port = '/dev/ttyACM1'
         self.baudrate = 38400
 
         self.gps_pub = self.create_publisher(

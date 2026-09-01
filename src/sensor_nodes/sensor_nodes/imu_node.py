@@ -1,12 +1,11 @@
-import rclpy
-from rclpy.node import Node
-from aruco_msgs.msg import ImuData
-from geometry_msgs.msg import Vector3
+#!/usr/bin/env python3
 
 import time
-import pickle
-import os
 import serial
+
+import rclpy
+from rclpy.node import Node
+from msgs.msg import ImuData
 
 
 class BNO055Node(Node):
@@ -16,76 +15,125 @@ class BNO055Node(Node):
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
-        self.line = "123"
+        self.line = ""
 
-        self.imu_pub_ = self.create_publisher(ImuData, '/imu_data', 10)
+        self.serial_port = None
+
+        self.imu_pub_ = self.create_publisher(
+            ImuData,
+            '/imu_data',
+            10
+        )
 
         self.initialize_imu()
 
+        # 100 Hz
         self.timer_ = self.create_timer(0.01, self.publish_imu)
 
     def initialize_imu(self):
-        self.serial_port = serial.Serial('/dev/ttyUSB0', 115200)
-        time.sleep(1)
+        """Reset and initialize the IMU."""
 
-        if self.serial_port:
-            print("into the serial port1")
-        else:
-            print("serial port issue")
+        # Close an existing port before reopening it
+        if self.serial_port is not None:
+            try:
+                if self.serial_port.is_open:
+                    self.serial_port.close()
+            except Exception:
+                pass
 
-        self.serial_port.dtr = False   # GPIO0 HIGH
-        self.serial_port.rts = True    # EN LOW (reset)
-        time.sleep(0.1)
+        try:
+            self.serial_port = serial.Serial(
+                '/dev/ttyUSB0',
+                115200,
+                timeout=1.0
+            )
 
-        self.serial_port.rts = False   # EN HIGH (run)
-        time.sleep(0.1)
+            time.sleep(1)
 
-        self.serial_port.dtr = True
-        self.serial_port.close()
+            self.get_logger().info("Connected to serial port")
 
-        self.serial_port = serial.Serial('/dev/ttyUSB0', 115200)
-        time.sleep(1)
+            # Reset device
+            self.serial_port.dtr = False
+            self.serial_port.rts = True
+            time.sleep(0.1)
 
-        if self.serial_port:
-            print("into the serial port reseted")
-        else:
-            print("serial port issue")
+            self.serial_port.rts = False
+            time.sleep(0.1)
 
-        # Wait until IMU sends usable yaw data
-        while True:
-            self.line = self.serial_port.readline().decode(
-                'utf-8', errors='ignore'
-            ).strip()
+            self.serial_port.dtr = True
 
-            print(self.line)
+            self.serial_port.close()
+            time.sleep(0.5)
 
-            if len(self.line) != 0 and str(self.line[0]) == "2":
-                break
+            # Reconnect after reset
+            self.serial_port = serial.Serial(
+                '/dev/ttyUSB0',
+                115200,
+                timeout=1.0
+            )
 
-        self.get_logger().info("Yaw usable")
+            time.sleep(1)
+
+            self.get_logger().info("Waiting for valid IMU data...")
+
+            while rclpy.ok():
+                self.line = self.serial_port.readline().decode(
+                    'utf-8',
+                    errors='ignore'
+                ).strip()
+
+                if not self.line:
+                    continue
+
+                print(self.line)
+
+                if self.line.startswith("2"):
+                    break
+
+            self.get_logger().info("IMU data usable")
+
+        except serial.SerialException as e:
+            self.get_logger().error(f"Serial port error: {e}")
+            self.serial_port = None
 
     def publish_imu(self):
 
-        self.line = self.serial_port.readline().decode(
-            'utf-8', errors='ignore'
-        ).strip()
-
-        # Empty or invalid line -> reinitialize IMU
-        if not self.line or self.line[0] != "2":
+        # Reconnect if serial port is unavailable
+        if self.serial_port is None or not self.serial_port.is_open:
+            self.get_logger().warn("IMU disconnected. Reinitializing...")
             self.initialize_imu()
             return
 
+        self.line = self.serial_port.readline().decode(
+            'utf-8',
+            errors='ignore'
+        ).strip()
+
+        # Ignore empty lines
+        if not self.line:
+            return
+
+        # Invalid packet
+        if not self.line.startswith("2"):
+            self.get_logger().warn(
+                f"Invalid IMU packet: {self.line}"
+            )
+            return
+
         try:
+            # Keep your original serial packet parsing:
+            # Remove first two characters and final character
             data = self.line[2:-1]
+
             xcv = data.split("_")
 
-            for i in range(len(xcv)):
-                xcv[i] = float(xcv[i])
+            if len(xcv) < 3:
+                raise ValueError("Expected roll, pitch and yaw data")
 
-            # Invert direction and normalize to 0-360 degrees
-            # Clockwise -> increasing angle
-            self.yaw = (-xcv[0]) % 360.0
+            # Convert correctly without using list.index()
+            xcv = [float(value) for value in xcv]
 
+            self.yaw = xcv[0]
             self.pitch = xcv[1]
             self.roll = xcv[2]
 
@@ -96,23 +144,38 @@ class BNO055Node(Node):
                 end='\r'
             )
 
-            imu_msg_ = ImuData()
+            imu_msg = ImuData()
 
-            imu_msg_.orientation.x = self.roll
-            imu_msg_.orientation.y = self.pitch
-            imu_msg_.orientation.z = self.yaw
+            # Your custom message convention:
+            # X = Roll
+            # Y = Pitch
+            # Z = Yaw
+            imu_msg.orientation.x = self.roll
+            imu_msg.orientation.y = self.pitch
+            imu_msg.orientation.z = self.yaw
 
-            imu_msg_.acceleration.x = 0.0
-            imu_msg_.acceleration.y = 0.0
-            imu_msg_.acceleration.z = 0.0
+            imu_msg.acceleration.x = 0.0
+            imu_msg.acceleration.y = 0.0
+            imu_msg.acceleration.z = 0.0
 
-            # Publish
-            self.imu_pub_.publish(imu_msg_)
+            self.imu_pub_.publish(imu_msg)
 
         except (ValueError, IndexError) as e:
             self.get_logger().warn(
-                f"Invalid IMU data received: '{self.line}'"
+                f"Failed to parse IMU data '{self.line}': {e}"
             )
+
+    def destroy_node(self):
+        """Close serial port when the node exits."""
+
+        if self.serial_port is not None:
+            try:
+                if self.serial_port.is_open:
+                    self.serial_port.close()
+            except Exception:
+                pass
+
+        super().destroy_node()
 
 
 def main(args=None):
@@ -123,15 +186,13 @@ def main(args=None):
         rclpy.spin(node)
 
     except KeyboardInterrupt:
-        if hasattr(node, 'save_calibration'):
-            node.save_calibration()
+        pass
 
     finally:
-        if hasattr(node, 'serial_port') and node.serial_port.is_open:
-            node.serial_port.close()
-
         node.destroy_node()
-        rclpy.shutdown()
+
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

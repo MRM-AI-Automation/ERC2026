@@ -1,11 +1,11 @@
 <?xml version="1.0"?>
 <package format="3">
 
-  <name>aruco_msgs</name>
+  <name>msgs</name>
   <version>0.0.1</version>
 
   <description>
-    Custom ROS 2 messages for ArUco detection and IMU data.
+    Custom ROS 2 messages for rover systems.
   </description>
 
   <maintainer email="vighneshreddysatti@gmail.com">mrmnavjet</maintainer>

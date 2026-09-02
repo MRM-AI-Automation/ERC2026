@@ -10,59 +10,63 @@ def generate_launch_description():
             executable='rtabmap',
             name='rtabmap',
             output='screen',
-            arguments=['-d'],  # Enable database mode
+            arguments=['-d'],
 
             parameters=[{
-                'frame_id': 'zed_camera_link',                     # Robot base frame
-                'odom_frame_id': 'odom',                     # Odometry frame
-                'map_frame_id': 'map',                       # Global map frame
+                'frame_id': 'zed_camera_link',
+                'odom_frame_id': 'odom',
+                'map_frame_id': 'map',
 
-                'rgb_frame_id': 'zed_left_camera_frame_optical',   # RGB optical frame
-                'depth_frame_id': 'zed_left_camera_frame_optical', # Depth optical frame
+                'rgb_frame_id': 'zed_left_camera_frame_optical',
+                'depth_frame_id': 'zed_left_camera_frame_optical',
 
-                'subscribe_rgb': True,                       # Subscribe to RGB images
-                'subscribe_depth': True,                     # Subscribe to depth images
-                'subscribe_rgbd': False,                     # No pre-synced RGBD
-                'subscribe_imu': False,                      # IMU disabled
+                'subscribe_rgb': True,
+                'subscribe_depth': True,
+                'subscribe_rgbd': False,
+                'subscribe_imu': False,
 
-                'approx_sync': True,                         # Approximate sync
-                'wait_for_transform': 1.2,                   # TF wait timeout
-                'tf_delay': 0.5,                              # TF delay compensation
-                'sync_queue_size': 20,                       # Sync buffer size
-                'topic_queue_size': 20,                      # ROS queue size
-                'qos_camera_info': 1,                        # SensorData QoS
+                'approx_sync': True,
+                'wait_for_transform': 1.2,
+                'tf_delay': 0.5,
+                'sync_queue_size': 20,
+                'topic_queue_size': 20,
+                'qos_camera_info': 1,
 
-                'use_sim_time': False,                       # Use system time
+                'use_sim_time': False,
 
-                'Rtabmap/DetectionRate': '10.0',              # SLAM update rate
-                'Rtabmap/TimeThr': '0',                      # No time limit
-                'Rtabmap/PublishOccupancyGrid': 'true',      # Publish grid
+                'Rtabmap/DetectionRate': '15.0',
+                'Rtabmap/TimeThr': '0',
+                'Rtabmap/PublishOccupancyGrid': 'true',
 
-                'Grid/Sensor': '1',                          # Depth sensor source
+                'RGBD/LoopClosureReextractFeatures': 'false',
+                'RGBD/ProximityBySpace': 'false',
+                'RGBD/ProximityByTime': '0',
+                'RGBD/OptimizeFromGraphEnd': 'false',
 
-                'Grid/3D': 'true',                           # Enable 3D grid
-                'Grid/MapFrameProjection': 'true',           # Project to map frame
+                'Grid/Sensor': '1',
+                'Grid/3D': 'true',
+                'Grid/MapFrameProjection': 'true',
 
-                'Grid/NormalK': '30',                         # Normal estimation neighbors
-                'Grid/MaxGroundAngle': '30',                 # Max ground slope
-                'Grid/GroundIsObstacle': 'false',             # Ground drop = obstacle
-                'Grid/MinGroundHeight': '-0.25',             # Min ground height
-                'Grid/MaxObstacleHeight': '5.0',             # Max obstacle height
+                'Grid/NormalK': '15',
+                'Grid/MaxGroundAngle': '30',
+                'Grid/GroundIsObstacle': 'false',
+                'Grid/MinGroundHeight': '-0.25',
+                'Grid/MaxObstacleHeight': '5.0',
 
-                'Grid/RangeMin': '0.0',                      # Min depth range
-                'Grid/RangeMax': '4.0',                      # Max depth range
+                'Grid/RangeMin': '0.0',
+                'Grid/RangeMax': '4.0',
 
-                'Grid/UnknownSpaceFilled': 'true',           # Unknown = occupied
+                'Grid/UnknownSpaceFilled': 'false',
 
-                'Grid/DepthDecimation': '1',                 # No decimation
-                'Grid/ObstacleFiltering': 'true',            # Enable filtering
-                'Grid/NoiseFilteringRadius': '0.0',          # Disable radius filter
-                'Grid/NoiseFilteringMinNeighbors': '5',      # Min neighbors
-                'Grid/MinClusterSize': '8',                  # Min cluster size
+                'Grid/DepthDecimation': '2',
+                'Grid/ObstacleFiltering': 'true',
+                'Grid/NoiseFilteringRadius': '0.0',
+                'Grid/NoiseFilteringMinNeighbors': '5',
+                'Grid/MinClusterSize': '5',
 
-                'Grid/CellSize': '0.10',                     # Grid resolution
+                'Grid/CellSize': '0.10',
 
-                'GridGlobal/FloodFillDepth': '12',           # Fill unknown gaps
+                'GridGlobal/FloodFillDepth': '12',
             }],
 
             remappings=[
@@ -73,7 +77,3 @@ def generate_launch_description():
             ]
         )
     ])
-
-
-
-

@@ -1,5 +1,5 @@
-#ifndef IRC_PLANNER_H_
-#define IRC_PLANNER_H_
+#ifndef LIDAR_PLANNER_H_
+#define LIDAR_PLANNER_H_
 
 #include <algorithm>
 #include <cmath>
@@ -11,17 +11,12 @@
 
 #include "geometry_msgs/msg/twist.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
-#include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_srvs/srv/trigger.hpp"
 
 #include "msgs/msg/aruco_tag.hpp"
 #include "msgs/msg/imu_data.hpp"
-
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-#include <pcl_conversions/pcl_conversions.h>
 
 namespace planner
 {
@@ -30,7 +25,7 @@ constexpr double kMaxLinearVel = 5.0;
 constexpr double kMaxAngularVel = 5.0;
 constexpr double kMinLinearVel = 0.0;
 constexpr double kMinAngularVel = 0.0;
-constexpr double kDistanceThreshold = 1.0;
+constexpr double kDistanceThreshold = 0.75;
 constexpr double kHeadingTolerance = 10.0;
 constexpr double kAlignWaitSec = 2.0;
 
@@ -72,38 +67,16 @@ public:
     SensorCallback();
 
 private:
-    // =========================================================
-    // Publishers
-    // =========================================================
-
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr vel_pub;
-
-    // =========================================================
-    // Subscribers
-    // =========================================================
 
     rclcpp::Subscription<msgs::msg::ImuData>::SharedPtr imu_sub_;
     rclcpp::Subscription<msgs::msg::ArucoTag>::SharedPtr aruco_sub_;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_sub_;
-
-    // Existing PointCloud2 subscriber
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
-
-    // LiDAR LaserScan subscriber
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
-
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr auto_sub_;
-
-    // =========================================================
-    // Services / Timers
-    // =========================================================
 
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr toggle_client_;
     rclcpp::TimerBase::SharedPtr stack_timer_;
-
-    // =========================================================
-    // State
-    // =========================================================
 
     State CurrState;
     SearchPattern FollowPattern;
@@ -128,42 +101,19 @@ private:
 
     double imu_yaw;
 
-    // =========================================================
-    // ArUco
-    // =========================================================
-
     bool aruco_detect;
     bool aruco_goal_reached;
     double aruco_x;
     double aruco_y;
     rclcpp::Time last_aruco_time_;
 
-    // =========================================================
-    // Obstacle state
-    // =========================================================
-
     bool obstacle_detect;
     double obs_x;
     double obs_y;
     const char *obs_side_{"center"};
 
-    // =========================================================
-    // PointCloud2 state
-    // =========================================================
-
-    pcl::PointCloud<pcl::PointXYZ>::Ptr last_point_cloud_;
-    rclcpp::Time last_pointcloud_time_;
-
-    // =========================================================
-    // LaserScan state
-    // =========================================================
-
     sensor_msgs::msg::LaserScan::SharedPtr last_scan_;
     rclcpp::Time last_scan_time_;
-
-    // =========================================================
-    // Search pattern
-    // =========================================================
 
     bool search_ref_set_;
     bool spot_turn_back_;
@@ -173,32 +123,16 @@ private:
     double search_forward_time_;
     SearchSkew search_skew;
 
-    // =========================================================
-    // Obstacle avoidance
-    // =========================================================
-
     bool avoiding_obstacle_;
     State prev_state_;
     SearchPattern prev_search_pattern_;
-
-    // =========================================================
-    // GPS obstacle avoidance
-    // =========================================================
 
     bool gps_avoiding_;
     int gps_avoid_direction_;
     bool gps_avoid_moving_forward_{false};
     rclcpp::Time gps_avoid_forward_end_;
 
-    // =========================================================
-    // Synchronization
-    // =========================================================
-
     std::mutex state_mutex_;
-
-    // =========================================================
-    // Main / state callbacks
-    // =========================================================
 
     void stackRun();
     void RoverStateClassifier();
@@ -209,25 +143,14 @@ private:
     void gpsCallback(
         const sensor_msgs::msg::NavSatFix::SharedPtr fix);
 
-    void pointCloudCallback(
-        const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg);
+    void scanCallback(
+        const sensor_msgs::msg::LaserScan::SharedPtr scan_msg);
 
     void arucoCallback(
         const msgs::msg::ArucoTag::SharedPtr msg);
 
     void stateCallback(
         const std_msgs::msg::Bool::SharedPtr state);
-
-    // =========================================================
-    // LaserScan callback
-    // =========================================================
-
-    void scanCallback(
-        const sensor_msgs::msg::LaserScan::SharedPtr scan_msg);
-
-    // =========================================================
-    // Navigation
-    // =========================================================
 
     void coordinateFollowing();
     void gpsObstacleAvoidance();
@@ -236,10 +159,6 @@ private:
     void callSearchPattern();
     void obstacleAvoidance();
     void obstacleClassifier();
-
-    // =========================================================
-    // Helpers
-    // =========================================================
 
     void setGoalStatus();
     void setSearchSkew(int skew);
@@ -256,4 +175,4 @@ private:
 
 } // namespace planner
 
-#endif // IRC_PLANNER_H_
+#endif // LIDAR_PLANNER_H_

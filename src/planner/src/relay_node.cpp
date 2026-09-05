@@ -29,7 +29,7 @@ class ArmStateSubscriber : public rclcpp::Node
 public:
     ArmStateSubscriber() : Node("arm_state_subscriber")
     {
-        udp_ip_tx_ = "10.0.0.79";
+        udp_ip_tx_ = "10.0.0.72";
         udp_port_tx_ = 5005;
 
         sock_tx_ = socket(AF_INET, SOCK_DGRAM, 0);
